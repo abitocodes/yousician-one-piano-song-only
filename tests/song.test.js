@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   SONG_FORMAT, SONG_VERSION, createSong, normalizeSong, songDuration, noteRange, isPlayable,
-  transposeNotes, shiftNotes, quantizeNotes, serializeSong, cloneSong,
+  transposeNotes, shiftNotes, quantizeNotes, serializeSong, cloneSong, lyricTimingNotes,
 } from '../js/core/song.js';
 
 const ERR = { message: '곡 파일 형식이 올바르지 않아요.' };
@@ -25,6 +25,8 @@ test('createSong fills defaults, id and timestamps', () => {
   assert.equal(s.beatsPerBar, 4);
   assert.equal(s.offset, 0);
   assert.deepEqual(s.notes, []);
+  assert.deepEqual(s.vocal, []);
+  assert.equal(s.arrangement, 'melody');
   assert.deepEqual(s.lyrics, { text: '', source: 'notes', lines: [] });
   assert.equal(s.audio, null);
   assert.ok(s.createdAt >= before && s.updatedAt >= before);
@@ -220,4 +222,78 @@ test('cloneSong deep clones', () => {
   c.lyrics.text = 'x';
   assert.equal(s.notes[0].m, 60);
   assert.equal(s.lyrics.text, '');
+});
+
+// ---------------------------------------------------------------- two-hand accompaniment fields
+
+test('normalizeSong: old songs load unchanged with arrangement melody and an empty vocal line', () => {
+  const old = { title: '옛 곡', notes: [{ t: 0, d: 0.5, m: 60 }], lyrics: { text: 'la', source: 'notes' } };
+  const s = normalizeSong(old);
+  assert.equal(s.arrangement, 'melody');
+  assert.deepEqual(s.vocal, []);
+  assert.deepEqual(s.notes, [{ t: 0, d: 0.5, m: 60 }]);
+  assert.deepEqual(s.lyrics.lines, [{ syllables: [{ text: 'la', t: 0, d: 0.5 }] }]);
+  for (const bad of ['Accompaniment', 'x', 1, null]) assert.equal(normalizeSong({ notes: [], arrangement: bad }).arrangement, 'melody');
+  assert.equal(normalizeSong({ notes: [], arrangement: 'accompaniment' }).arrangement, 'accompaniment');
+  assert.deepEqual(normalizeSong({ notes: [], vocal: 'x' }).vocal, []);
+});
+
+test('normalizeSong keeps hand tags R/L only and sanitizes/sorts the vocal line like notes', () => {
+  const s = normalizeSong({
+    arrangement: 'accompaniment',
+    notes: [
+      { t: 1, d: 1, m: 48, h: 'L' },
+      { t: 1, d: 1, m: 64, h: 'R', v: 0.5 },
+      { t: 0, d: 1, m: 60, h: 'r' },
+      { t: 0, d: 1, m: 55, h: 'X' },
+    ],
+    vocal: [{ t: 1.0004, d: 0.5, m: 67, h: 'R' }, { t: 0, d: -1, m: '64' }, { t: 'x', m: 60 }, null, { t: 2, d: 1, m: 200 }],
+  });
+  assert.deepEqual(s.notes, [
+    { t: 0, d: 1, m: 55 }, { t: 0, d: 1, m: 60 }, { t: 1, d: 1, m: 48, h: 'L' }, { t: 1, d: 1, m: 64, v: 0.5, h: 'R' },
+  ]);
+  assert.deepEqual(s.vocal, [{ t: 0, d: 0.1, m: 64 }, { t: 1, d: 0.5, m: 67 }]);
+  assert.deepEqual(normalizeSong(JSON.parse(serializeSong(s))), s);
+});
+
+test('lyricTimingNotes: the vocal line when present, else the notes', () => {
+  const notes = [{ t: 0, d: 1, m: 48 }];
+  const vocal = [{ t: 0.5, d: 0.5, m: 67 }];
+  assert.equal(lyricTimingNotes({ notes, vocal }), vocal);
+  assert.equal(lyricTimingNotes({ notes, vocal: [] }), notes);
+  assert.equal(lyricTimingNotes({ notes }), notes);
+  assert.deepEqual(lyricTimingNotes({}), []);
+  assert.deepEqual(lyricTimingNotes(null), []);
+});
+
+test('normalizeSong times lyric text against the vocal line when there is one', () => {
+  const notes = [{ t: 0, d: 2, m: 48, h: 'L' }, { t: 0, d: 2, m: 64, h: 'R' }, { t: 0, d: 2, m: 67, h: 'R' }];
+  const vocal = [{ t: 0.5, d: 0.5, m: 67 }, { t: 1, d: 1, m: 69 }];
+  const s = normalizeSong({ notes, vocal, arrangement: 'accompaniment', lyrics: { text: 'la li', source: 'notes' } });
+  assert.deepEqual(s.lyrics.lines, [{ syllables: [{ text: 'la ', t: 0.5, d: 0.5 }, { text: 'li', t: 1, d: 1 }] }]);
+  // vocal only (no played notes yet) still gets timed lyrics
+  const v = normalizeSong({ notes: [], vocal, lyrics: '하 둘' });
+  assert.deepEqual(v.lyrics.lines[0].syllables.map((x) => x.t), [0.5, 1]);
+});
+
+test('songDuration includes the vocal line', () => {
+  const s = createSong({ notes: [{ t: 0, d: 1, m: 48 }], vocal: [{ t: 2, d: 1.5, m: 67 }] });
+  assert.equal(songDuration(s), 3.5);
+  assert.equal(songDuration({ notes: [{ t: 0, d: 1, m: 48 }] }), 1);
+});
+
+test('note transforms and cloneSong keep hand tags (and other note fields)', () => {
+  const src = [{ t: 0.5, d: 0.5, m: 48, h: 'L' }, { t: 1, d: 1, m: 64, h: 'R', v: 0.7 }];
+  assert.deepEqual(transposeNotes(src, 2).map((n) => [n.m, n.h]), [[50, 'L'], [66, 'R']]);
+  assert.deepEqual(shiftNotes(src, -0.5).map((n) => [n.t, n.h]), [[0, 'L'], [0.5, 'R']]);
+  assert.deepEqual(quantizeNotes(src, 60, 0, 1), [{ t: 1, d: 1, m: 48, h: 'L' }, { t: 1, d: 1, m: 64, h: 'R', v: 0.7 }]);
+  // same pitch collapsing onto one start: longer wins, a right-hand tag wins
+  assert.deepEqual(quantizeNotes([{ t: 0, d: 2, m: 60, h: 'L' }, { t: 0.1, d: 0.5, m: 60, h: 'R' }], 60, 0, 1),
+    [{ t: 0, d: 2, m: 60, h: 'R' }]);
+  const song = createSong({ notes: src, vocal: [{ t: 0, d: 1, m: 67 }], arrangement: 'accompaniment' });
+  const c = cloneSong(song);
+  assert.deepEqual(c, song);
+  assert.equal(c.notes[0].h, 'L');
+  c.vocal[0].m = 60;
+  assert.equal(song.vocal[0].m, 67);
 });

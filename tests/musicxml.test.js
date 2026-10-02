@@ -1,9 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  parseXml, readScoreText, isScoreFileName, parseMusicXml, recommendTrack, scoreToSong,
+  parseXml, readScoreText, isScoreFileName, parseMusicXml, recommendTrack, scoreToSong, scoreToArrangement,
+  recommendArrangement,
 } from '../js/core/musicxml.js';
-import { assignLyrics, tokenizeLine, lyricsPlainText } from '../js/core/lyrics.js';
+import { assignLyrics, tokenizeLine, lyricsPlainText, groupNoteEvents } from '../js/core/lyrics.js';
+import { simplifyAccompaniment } from '../js/core/arrange.js';
+import { normalizeSong } from '../js/core/song.js';
 import { makeZip } from './helpers-zip.js';
 
 // All fixtures are original: simple scales/arpeggios with placeholder words (하나 둘 셋, la, 가나다…).
@@ -227,7 +230,7 @@ test('parseMusicXml: metadata, part/track info, time signature, tempo, verses', 
   assert.equal(voice.max, 71);
   assert.deepEqual(voice.tracks, [{
     key: 'P1|s1|v1', partId: 'P1', staff: 1, voice: '1', label: '보컬 · 1단 · 성부 1',
-    noteCount: 3, lyricCount: 3, min: 67, max: 71, avgPitch: 69,
+    noteCount: 3, lyricCount: 3, min: 67, max: 71, avgPitch: 69, allNotes: 3, allMin: 67, allMax: 71,
   }]);
   assert.equal(other.name, '파트 2');
   assert.equal(other.tracks[0].key, 'P2|s1|v5');
@@ -712,4 +715,458 @@ test('.mxl end to end: unzip → parse → song', async () => {
   assert.deepEqual(ts(song), [0, 1, 2, 4, 6]);
   assert.equal(song.lyricText, '하 나 둘~ 셋');
   assert.deepEqual(aligned(song).starts, [0, 1, 2, 6]);
+});
+
+// ---------------------------------------------------------------- two-hand accompaniment (scoreToArrangement)
+
+// Chord: first note normal, the rest with <chord/>.
+const CH = (ps, dur, o = {}) => ps.map((p, k) => N(p, dur, { ...o, chord: k > 0 })).join('');
+
+// Mimics OMR output of a "piano 3-stave" score: 3 parts (one staff, one voice each), generic part names, no tempo.
+// P1 = sung melody (placeholder words, optional), P2 = right-hand chords, P3 = left-hand bass.
+// OMR damage: P2 measure 2 is over-full (a misread duration: 5 quarters in 4/4), P3 measure 3 is short.
+const OMR_WORDS = ['하', '나', '둘', '셋', '넷', '다', '섯', '여', '덟', '아', '홉'];
+function omrScore({ lyrics = true } = {}) {
+  let w = 0;
+  const v = (p, dur) => N(p, dur, lyrics ? { lyric: OMR_WORDS[w++] } : {});
+  const vocal = [
+    M(attrs() + v('E4', 1) + v('D4', 1) + v('C4', 2)),
+    M(v('F4', 1) + v('A4', 1) + v('G4', 2)),
+    M(v('G4', 1) + v('F4', 1) + v('E4', 1) + v('D4', 1)),
+    M(v('C4', 4)),
+  ];
+  const rh = [
+    M(attrs() + CH(['E4', 'G4', 'C5'], 2) + CH(['E4', 'G4', 'C5'], 2)),
+    M(CH(['F4', 'A4', 'C5'], 2) + CH(['F4', 'A4', 'C5'], 3)), // over-full
+    M(CH(['D4', 'G4', 'B4'], 2) + CH(['D4', 'F4', 'B4'], 2)),
+    M(CH(['E4', 'G4', 'C5'], 4)),
+  ];
+  const lh = [
+    M(attrs() + N('C3', 4)),
+    M(N('F2', 2) + N('F3', 2)),
+    M(N('G2', 2)), // short: the second half was not recognized
+    M(N('C3', 2) + N('C2', 2)),
+  ];
+  return partwise([
+    { id: 'P1', name: 'MusicXML Part', measures: vocal },
+    { id: 'P2', name: 'MusicXML Part', measures: rh },
+    { id: 'P3', name: 'MusicXML Part', measures: lh },
+  ]);
+}
+
+const OMR_KEYS = { vocalKey: 'P1|s1|v1', playKeys: ['P2|s1|v1', 'P3|s1|v1'] };
+const at = (notes, t) => notes.filter((n) => Math.abs(n.t - t) < 1e-6).map((n) => n.m);
+
+test('scoreToArrangement: OMR 3-part score → both hands + vocal on ONE timeline despite bad measures', () => {
+  const score = parseMusicXml(omrScore());
+  const res = scoreToArrangement(score, OMR_KEYS);
+  const q = 0.6; // no tempo → 100 BPM
+  assert.equal(res.bpm, 100);
+  assert.equal(res.beatsPerBar, 4);
+  assert.equal(res.offset, 0);
+
+  // vocal: the sung melody, measure starts 0 / 4 / 8 / 12 quarters
+  assert.deepEqual(res.vocal.map((n) => n.m), [64, 62, 60, 65, 69, 67, 67, 65, 64, 62, 60]);
+  closeAll(res.vocal.map((n) => n.t), [0, 1, 2, 4, 5, 6, 8, 9, 10, 11, 12].map((x) => x * q));
+  assert.equal(res.vocal.some((n) => 'h' in n), false);
+
+  // hands: P2 (higher) → right, P3 → left; chords are kept
+  const rh = res.notes.filter((n) => n.h === 'R');
+  const lh = res.notes.filter((n) => n.h === 'L');
+  assert.equal(rh.length + lh.length, res.notes.length);
+  assert.deepEqual(lh.map((n) => n.m), [48, 41, 53, 43, 48, 36]);
+  assert.deepEqual(at(rh, 0), [64, 67, 72]);
+  assert.deepEqual(res.stats, { right: 21, left: 6, vocal: 11, syllables: 11 });
+
+  // the over-full right-hand measure 2 is squeezed into its 4 quarters …
+  closeAll([...new Set(rh.filter((n) => n.t >= 4 * q - 1e-6 && n.t < 8 * q).map((n) => n.t))], [4 * q, 5.6 * q], 0.001);
+  // … so measures 3 and 4 line up: chord, bass and sung note written on the same beat share one time
+  for (const beat of [8, 12]) {
+    const t = beat * q;
+    assert.ok(at(rh, t).length >= 3, `right-hand chord at beat ${beat}`);
+    assert.equal(at(lh, t).length, 1, `bass at beat ${beat}`);
+    assert.equal(at(res.vocal, t).length, 1, `sung note at beat ${beat}`);
+  }
+  assert.deepEqual(at(res.notes, 8 * q), [43, 62, 67, 71]);
+  assert.deepEqual(at(res.notes, 12 * q), [48, 64, 67, 72]);
+  assert.deepEqual(at(lh, 14 * q), [36]);
+  assert.deepEqual(res.notes, [...res.notes].sort((a, b) => a.t - b.t || a.m - b.m));
+
+  // per-track conversion (scoreToSong) would have drifted by the extra quarter
+  const alone = scoreToSong(score, { trackKey: 'P2|s1|v1', melodyOnly: false });
+  close(alone.notes.find((n) => n.m === 71).t, 9 * q);
+
+  assert.ok(res.warnings.some((w) => w.includes('빠르기 표시가 없어')));
+  assert.ok(res.warnings.some((w) => w.includes('맞춰 정렬한 마디') && w.includes('2번째 마디')), res.warnings.join(' / '));
+});
+
+test('scoreToArrangement: lyric text aligns with the vocal notes (one token per vocal note event)', () => {
+  const res = scoreToArrangement(parseMusicXml(omrScore()), OMR_KEYS);
+  assert.equal(tokenizeLine(res.lyricText.replace(/\n/g, ' ')).length, groupNoteEvents(res.vocal).length);
+  const fit = assignLyrics(res.lyricText, res.vocal);
+  assert.deepEqual(fit.warnings, []);
+  const syls = fit.lines.flatMap((l) => l.syllables);
+  assert.deepEqual(syls.map((x) => x.text.trim()), OMR_WORDS);
+  assert.deepEqual(syls.map((x) => x.t), res.vocal.map((n) => n.t));
+
+  // what the editor stores: simplified notes + vocal; lyrics are timed on the vocal line, not on the chords
+  const song = normalizeSong({
+    title: '연습', arrangement: 'accompaniment', bpm: res.bpm, beatsPerBar: res.beatsPerBar, offset: res.offset,
+    notes: simplifyAccompaniment(res.notes, { right: 2, left: 1 }), vocal: res.vocal,
+    lyrics: { text: res.lyricText, source: 'notes' },
+  });
+  assert.equal(song.arrangement, 'accompaniment');
+  assert.deepEqual(song.lyrics.lines.flatMap((l) => l.syllables).map((x) => x.t), res.vocal.map((n) => n.t));
+  assert.equal(at(song.notes, 0).length, 3); // 2 right-hand notes + 1 bass note
+  assert.equal(song.notes.every((n) => n.h === 'R' || n.h === 'L'), true);
+});
+
+test('scoreToArrangement: vocal without lyrics (typical OMR) → empty lyric text, same timeline', () => {
+  const withWords = scoreToArrangement(parseMusicXml(omrScore()), OMR_KEYS);
+  const res = scoreToArrangement(parseMusicXml(omrScore({ lyrics: false })), OMR_KEYS);
+  assert.equal(res.lyricText, '');
+  assert.equal(res.stats.syllables, 0);
+  assert.ok(res.warnings.includes('악보에 가사가 없어요.'));
+  assert.deepEqual(res.vocal, withWords.vocal);
+  assert.deepEqual(res.notes, withWords.notes);
+  // lyrics the user pastes later are timed against the vocal line
+  const pasted = assignLyrics('la la la la la la la la la la la', res.vocal);
+  assert.deepEqual(pasted.warnings, []);
+  const off = scoreToArrangement(parseMusicXml(omrScore()), { ...OMR_KEYS, includeLyrics: false });
+  assert.equal(off.lyricText, '');
+  assert.ok(!off.warnings.includes('악보에 가사가 없어요.'));
+});
+
+test('scoreToArrangement: a pickup shorter in one part than in the others is aligned to the downbeat', () => {
+  const build = (fullPianoPickup) => partwise([
+    { id: 'P1', name: 'Voice', measures: [
+      M(attrs() + N('G4', 1, { lyric: '라' })),
+      M(N('C5', 4, { lyric: '라' })),
+    ] },
+    { id: 'P2', name: 'Piano', measures: [
+      M(attrs() + (fullPianoPickup ? R(3) : '') + CH(['B3', 'D4', 'G4'], 1)),
+      M(CH(['E4', 'G4', 'C5'], 4)),
+    ] },
+    { id: 'P3', name: 'Piano', measures: [
+      M(attrs() + (fullPianoPickup ? R(3) : '') + N('G2', 1)),
+      M(N('C3', 4)),
+    ] },
+  ]);
+  for (const full of [false, true]) {
+    const res = scoreToArrangement(parseMusicXml(build(full)), OMR_KEYS);
+    assert.deepEqual(res.vocal.map((n) => n.t), [1.8, 2.4], `full piano pickup: ${full}`);
+    assert.deepEqual(at(res.notes, 1.8), [43, 59, 62, 67]);
+    assert.deepEqual(at(res.notes, 2.4), [48, 64, 67, 72]);
+    assert.deepEqual(assignLyrics(res.lyricText, res.vocal).warnings, []);
+  }
+});
+
+test('scoreToArrangement: repeats written in one part only unfold every track the same way', () => {
+  const back = '<barline location="right"><repeat direction="backward"/></barline>';
+  const xml = partwise([
+    { id: 'P1', name: 'Voice', measures: [
+      M(attrs() + words('♩ = 120') + N('C4', 2, { lyric: '가' }) + N('E4', 2, { lyric: '나' })),
+      M(N('G4', 4, { lyric: '다' }), { right: back }),
+      M(N('C5', 4, { lyric: '라' })),
+    ] },
+    { id: 'P2', name: 'Piano', measures: [
+      M(attrs() + CH(['E4', 'G4'], 4)), M(CH(['D4', 'B4'], 4)), M(CH(['E4', 'C5'], 4)),
+    ] },
+    { id: 'P3', name: 'Piano', measures: [M(attrs() + N('C3', 4)), M(N('G2', 4)), M(N('C3', 4))] },
+  ]);
+  const score = parseMusicXml(xml);
+  const res = scoreToArrangement(score, OMR_KEYS);
+  assert.equal(res.bpm, 120);
+  assert.deepEqual(res.vocal.map((n) => n.t), [0, 1, 2, 4, 5, 6, 8]);
+  assert.deepEqual(res.notes.filter((n) => n.h === 'L').map((n) => [n.t, n.m]), [[0, 48], [2, 43], [4, 48], [6, 43], [8, 48]]);
+  assert.equal(res.notes.length, 15);
+  assert.equal(res.lyricText.replace(/\s+/g, ' '), '가 나 다 가 나 다 라');
+  assert.deepEqual(assignLyrics(res.lyricText, res.vocal).warnings, []);
+  const flat = scoreToArrangement(score, { ...OMR_KEYS, unfoldRepeats: false });
+  assert.deepEqual(flat.vocal.map((n) => n.t), [0, 1, 2, 4]);
+  assert.equal(flat.notes.length, 9);
+});
+
+test('scoreToArrangement: hands option, single play track split at middle C, bpm override, no vocal', () => {
+  const score = parseMusicXml(omrScore());
+  const swapped = scoreToArrangement(score, { ...OMR_KEYS, hands: { 'P2|s1|v1': 'L', 'P3|s1|v1': 'R' } });
+  assert.deepEqual(swapped.notes.filter((n) => n.h === 'R').map((n) => n.m), [48, 41, 53, 43, 48, 36]);
+  assert.deepEqual(swapped.stats, { right: 6, left: 21, vocal: 11, syllables: 11 });
+  const partial = scoreToArrangement(score, { ...OMR_KEYS, hands: { 'P3|s1|v1': 'L', 'P2|s1|v1': 'x' } });
+  assert.equal(partial.stats.right, 21);
+
+  const single = scoreToArrangement(score, { vocalKey: 'P1|s1|v1', playKeys: ['P3|s1|v1', 'P3|s1|v1'] });
+  assert.equal(single.notes.length, 6);
+  for (const n of single.notes) assert.equal(n.h, n.m >= 60 ? 'R' : 'L');
+  const vocalToo = scoreToArrangement(score, { vocalKey: 'P1|s1|v1', playKeys: ['P1|s1|v1'] });
+  assert.deepEqual(vocalToo.notes.map((n) => n.h), vocalToo.notes.map((n) => (n.m >= 60 ? 'R' : 'L')));
+  assert.deepEqual(vocalToo.notes.map((n) => n.t), vocalToo.vocal.map((n) => n.t));
+
+  const fast = scoreToArrangement(score, { ...OMR_KEYS, bpm: 120 });
+  assert.equal(fast.bpm, 120);
+  assert.deepEqual(at(fast.notes, 4), [43, 62, 67, 71]);
+  assert.ok(!fast.warnings.some((w) => w.includes('빠르기 표시가 없어')));
+
+  const noVocal = scoreToArrangement(score, { playKeys: OMR_KEYS.playKeys });
+  assert.deepEqual(noVocal.vocal, []);
+  assert.equal(noVocal.lyricText, '');
+  assert.equal(noVocal.stats.vocal, 0);
+  assert.ok(noVocal.warnings.some((w) => w.includes('노래 멜로디 성부를 고르지 않아')));
+  // without the vocal part the two piano parts tie on measure 2 → the longer length is kept, still aligned
+  assert.deepEqual(at(noVocal.notes, 9 * 0.6), [43, 62, 67, 71]);
+  assert.ok(noVocal.warnings.some((w) => w.includes('(2번째 마디)')), noVocal.warnings.join(' / '));
+});
+
+test('scoreToArrangement: a part that only ends early (closing partial measure) needs no alignment warning', () => {
+  const xml = partwise([
+    { id: 'P1', name: 'Voice', measures: [M(attrs() + tempo(60) + N('E4', 4)), M(N('C4', 2))] },
+    { id: 'P2', name: 'Piano', measures: [M(attrs() + CH(['G4', 'C5'], 4)), M(CH(['E4', 'C5'], 4))] },
+    { id: 'P3', name: 'Piano', measures: [M(attrs() + N('C3', 4)), M(N('C3', 4))] },
+  ]);
+  const res = scoreToArrangement(parseMusicXml(xml), OMR_KEYS);
+  assert.deepEqual(res.vocal.map((n) => [n.t, n.d]), [[0, 4], [4, 2]]);
+  assert.deepEqual(at(res.notes, 4), [48, 64, 72]);
+  assert.deepEqual(res.warnings, ['악보에 가사가 없어요.']);
+});
+
+test('scoreToArrangement: first and last measures follow the longest part (the short parts are the incomplete ones)', () => {
+  const KEYS = OMR_KEYS;
+  const notesOf = (res, h) => res.notes.filter((n) => !h || n.h === h).map((n) => [n.t, n.d, n.m]);
+  // 60 BPM: one quarter = 1 s. (A) The sung pickup is two quarters; both piano parts wrote only their one-beat entry.
+  const xmlA = partwise([
+    { id: 'P1', name: 'Voice', measures: [M(attrs() + tempo(60) + N('E4', 1) + N('G4', 1)), M(N('C5', 4))] },
+    { id: 'P2', name: 'Piano', measures: [M(attrs() + CH(['B3', 'D4', 'G4'], 1)), M(CH(['E4', 'G4', 'C5'], 4))] },
+    { id: 'P3', name: 'Piano', measures: [M(attrs() + N('G2', 1)), M(N('C3', 4))] },
+  ]);
+  const a = scoreToArrangement(parseMusicXml(xmlA), KEYS);
+  assert.deepEqual(a.vocal.map((n) => [n.t, n.d, n.m]), [[2, 1, 64], [3, 1, 67], [4, 4, 72]]);
+  assert.deepEqual(a.vocal.map((n) => n.t), scoreToSong(parseMusicXml(xmlA), { trackKey: 'P1|s1|v1' }).notes.map((n) => n.t),
+    'the sung line keeps the times it has on its own');
+  assert.deepEqual(at(a.notes, 3), [43, 59, 62, 67], 'the piano entry is on the last beat of the pickup');
+  assert.deepEqual(at(a.notes, 4), [48, 64, 67, 72]);
+
+  // (B) The right hand wrote a full-bar pickup (rests, then a chord on beat 4); the vocal and the bass only their entry.
+  const xmlB = partwise([
+    { id: 'P1', name: 'Voice', measures: [M(attrs() + tempo(60) + N('G4', 1)), M(N('C5', 4))] },
+    { id: 'P2', name: 'Piano', measures: [M(attrs() + R(3) + CH(['B3', 'D4', 'G4'], 1)), M(CH(['E4', 'G4', 'C5'], 4))] },
+    { id: 'P3', name: 'Piano', measures: [M(attrs() + N('G2', 1)), M(N('C3', 4))] },
+  ]);
+  const b = scoreToArrangement(parseMusicXml(xmlB), KEYS);
+  assert.deepEqual(b.vocal.map((n) => [n.t, n.d, n.m]), [[3, 1, 67], [4, 4, 72]]);
+  assert.deepEqual(notesOf(b).filter((x) => x[0] < 4), [[3, 1, 43], [3, 1, 59], [3, 1, 62], [3, 1, 67]],
+    'the full-bar chord keeps its beat and length');
+
+  // (C) Last measure: the sung line and the bass stop after two beats (trailing rests not recognised), the right hand
+  // plays chords on beats 1 and 3.
+  const xmlC = partwise([
+    { id: 'P1', name: 'Voice', measures: [M(attrs() + tempo(60) + N('E4', 4)), M(N('C4', 2))] },
+    { id: 'P2', name: 'Piano', measures: [M(attrs() + CH(['G4', 'C5'], 4)), M(CH(['E4', 'G4'], 2) + CH(['E4', 'C5'], 2))] },
+    { id: 'P3', name: 'Piano', measures: [M(attrs() + N('C3', 4)), M(N('C3', 2))] },
+  ]);
+  const c = scoreToArrangement(parseMusicXml(xmlC), KEYS);
+  assert.deepEqual(notesOf(c, 'R').filter((x) => x[0] >= 4), [[4, 2, 64], [4, 2, 67], [6, 2, 64], [6, 2, 72]]);
+  assert.deepEqual(c.warnings, ['악보에 가사가 없어요.']);
+
+  // An over-full first measure (a misread duration) is still squeezed into the time signature's length.
+  const xmlD = partwise([
+    { id: 'P1', name: 'Voice', measures: [M(attrs() + tempo(60) + N('C4', 4)), M(N('E4', 4))] },
+    { id: 'P2', name: 'Piano', measures: [M(attrs() + CH(['E4', 'G4'], 2) + CH(['F4', 'A4'], 3)), M(CH(['G4', 'C5'], 4))] },
+    { id: 'P3', name: 'Piano', measures: [M(attrs() + N('C3', 4)), M(N('C3', 4))] },
+  ]);
+  const d = scoreToArrangement(parseMusicXml(xmlD), KEYS);
+  assert.deepEqual(at(d.notes, 1.6), [65, 69]);
+  assert.deepEqual(at(d.notes, 4), [48, 67, 72]);
+  assert.deepEqual(d.vocal.map((n) => n.t), [0, 4]);
+  assert.ok(d.warnings.some((w) => w.includes('(1번째 마디)')), d.warnings.join(' / '));
+});
+
+test('scoreToArrangement: a part that missed a time signature change keeps its notes when they fit', () => {
+  // 60 BPM. Measure 2 is a 2/4 bar; the OMR missed the change in the left-hand part only (still 4/4 there, but its
+  // content is the 2 beats of the bar).
+  const ts24 = '<attributes><time><beats>2</beats><beat-type>4</beat-type></time></attributes>';
+  const ts44 = '<attributes><time><beats>4</beats><beat-type>4</beat-type></time></attributes>';
+  const xml = partwise([
+    { id: 'P1', name: 'Voice', measures: [M(attrs() + tempo(60) + N('C4', 4)), M(ts24 + N('D4', 2)), M(ts44 + N('E4', 4))] },
+    { id: 'P2', name: 'Piano', measures: [M(attrs() + CH(['E4', 'G4'], 4)), M(ts24 + CH(['F4', 'A4'], 2)), M(ts44 + CH(['G4', 'C5'], 4))] },
+    { id: 'P3', name: 'Piano', measures: [M(attrs() + N('C3', 4)), M(N('D3', 1) + N('A2', 1)), M(N('C3', 4))] },
+  ]);
+  const res = scoreToArrangement(parseMusicXml(xml), OMR_KEYS);
+  assert.deepEqual(res.notes.filter((n) => n.h === 'L').map((n) => [n.t, n.d, n.m]), [[0, 4, 48], [4, 1, 50], [5, 1, 45], [6, 4, 48]]);
+  assert.deepEqual(at(res.notes, 6), [48, 67, 72]);
+  assert.deepEqual(res.vocal.map((n) => n.t), [0, 4, 6]);
+  assert.ok(!res.warnings.some((w) => w.includes('맞춰 정렬한 마디')), res.warnings.join(' / '));
+});
+
+test('scoreToArrangement: errors', () => {
+  const score = parseMusicXml(omrScore());
+  assert.throws(() => scoreToArrangement(score, { vocalKey: 'P1|s1|v1' }), { message: '연주할 성부를 하나 이상 골라 주세요.' });
+  assert.throws(() => scoreToArrangement(score, { playKeys: [] }), { message: '연주할 성부를 하나 이상 골라 주세요.' });
+  assert.throws(() => scoreToArrangement(score, { playKeys: ['P9|s1|v1'] }), { message: '선택한 성부를 찾을 수 없어요.' });
+  assert.throws(() => scoreToArrangement(score, { vocalKey: 'P9|s1|v1', playKeys: ['P2|s1|v1'] }),
+    { message: '선택한 성부를 찾을 수 없어요.' });
+  assert.throws(() => scoreToArrangement({}, OMR_KEYS), { message: '악보 정보가 올바르지 않아요.' });
+  assert.throws(() => scoreToArrangement(null), { message: '악보 정보가 올바르지 않아요.' });
+});
+
+// ---------------------------------------------------------------- recommendArrangement
+
+test('recommendArrangement: OMR 3-part score with or without lyrics', () => {
+  const expected = {
+    vocalKey: 'P1|s1|v1', playKeys: ['P2|s1|v1', 'P3|s1|v1'], hands: { 'P2|s1|v1': 'R', 'P3|s1|v1': 'L' },
+  };
+  assert.deepEqual(recommendArrangement(parseMusicXml(omrScore())), expected);
+  assert.deepEqual(recommendArrangement(parseMusicXml(omrScore({ lyrics: false }))), expected);
+});
+
+test('recommendArrangement without lyrics: the singable one-note line, not the higher busy chord part', () => {
+  const run = (k, fn) => {
+    const out = [];
+    for (let j = 0; j < k; j++) out.push(fn(j));
+    return out;
+  };
+  const mel = ['C4', 'D4', 'E4', 'F4', 'G4', 'A4', 'G4', 'E4'];
+  const xml = partwise([
+    { id: 'P1', name: '', measures: [M(attrs() + mel.slice(0, 4).map((p) => N(p, 1)).join('')), M(mel.slice(4).map((p) => N(p, 1)).join(''))] },
+    { id: 'P2', name: '', measures: run(2, (j) => M((j ? '' : attrs()) + run(4, () => CH(['E5', 'G5', 'C6'], 1)).join(''))) },
+    { id: 'P3', name: '', measures: run(2, (j) => M((j ? '' : attrs()) + ['C3', 'G2', 'C3', 'G2'].map((p) => N(p, 1)).join(''))) },
+  ]);
+  const score = parseMusicXml(xml);
+  assert.equal(recommendTrack(score), 'P2|s1|v1'); // the plain melody heuristic picks the top line
+  assert.deepEqual(recommendArrangement(score), {
+    vocalKey: 'P1|s1|v1', playKeys: ['P2|s1|v1', 'P3|s1|v1'], hands: { 'P2|s1|v1': 'R', 'P3|s1|v1': 'L' },
+  });
+
+  // a part named like a voice wins when that singles it out
+  const named = parseMusicXml(partwise([
+    { id: 'P1', name: 'Flute', measures: [M(attrs() + ['C6', 'D6', 'E6', 'F6'].map((p) => N(p, 1)).join(''))] },
+    { id: 'P2', name: 'Voice', measures: [M(attrs() + ['C4', 'D4', 'E4', 'F4'].map((p) => N(p, 1)).join(''))] },
+    { id: 'P3', name: 'Piano', measures: [M(attrs() + N('C3', 4))] },
+  ]));
+  assert.equal(recommendArrangement(named).vocalKey, 'P2|s1|v1');
+});
+
+test('recommendArrangement: solo piano grand staff → melody staff times the lyrics and is played too', () => {
+  const melody = ['E5', 'D5', 'C5', 'D5', 'E5', 'E5', 'E5', 'D5'];
+  const xml = partwise([{ id: 'P1', name: 'Piano', measures: [
+    M(attrs({ staves: 2 }) + melody.slice(0, 4).map((p) => N(p, 1, { staff: 1 })).join('')
+      + backup(4) + N('C3', 4, { staff: 2, voice: 5 })),
+    M(melody.slice(4).map((p) => N(p, 1, { staff: 1 })).join('') + backup(4) + N('G2', 4, { staff: 2, voice: 5 })),
+  ] }]);
+  const score = parseMusicXml(xml);
+  const rec = recommendArrangement(score);
+  assert.deepEqual(rec, {
+    vocalKey: 'P1|s1|v1', playKeys: ['P1|s1|v1', 'P1|s2|v5'], hands: { 'P1|s1|v1': 'R', 'P1|s2|v5': 'L' },
+  });
+  const res = scoreToArrangement(score, rec);
+  assert.equal(res.stats.right, 8);
+  assert.equal(res.stats.left, 2);
+  assert.equal(res.vocal.length, 8);
+  assert.deepEqual(res.warnings.filter((w) => w.includes('마디')), []);
+});
+
+test('recommendArrangement: lyrics on a chord staff (piano + words) keep that staff played; merged keys skipped', () => {
+  const xml = partwise([
+    { id: 'P1', name: 'Piano', measures: [
+      M(attrs({ staves: 2 }) + CH(['C4', 'E4', 'G4'], 2, { staff: 1, lyric: '하' }) + CH(['D4', 'F4', 'A4'], 2, { staff: 1, lyric: '나' })
+        + backup(4) + N('C3', 4, { staff: 2, voice: 5 })),
+    ] },
+  ]);
+  const rec = recommendArrangement(parseMusicXml(xml));
+  assert.equal(rec.vocalKey, 'P1|s1|v1');
+  assert.deepEqual(rec.playKeys, ['P1|s1|v1', 'P1|s2|v5']);
+
+  // a vocal part plus a one-staff piano part with two voices: the merged key is not listed
+  const twoVoices = parseMusicXml(partwise([
+    { id: 'P1', name: 'Voice', measures: [M(attrs() + N('E4', 2, { lyric: 'la' }) + N('G4', 2, { lyric: 'la' }))] },
+    { id: 'P2', name: 'Piano', measures: [M(attrs() + N('C5', 4, { voice: 1 }) + backup(4) + N('C4', 4, { voice: 2 }))] },
+  ]));
+  assert.deepEqual(twoVoices.parts[1].tracks.map((t) => t.key), ['P2|s1|v1', 'P2|s1|v2', 'P2|s1|*']);
+  assert.deepEqual(recommendArrangement(twoVoices), { vocalKey: 'P1|s1|v1', playKeys: ['P2|s1|v1', 'P2|s1|v2'], hands: {} });
+});
+
+test('recommendArrangement: one part with a sung staff above a piano grand staff (3 staves) → the sung staff is not played', () => {
+  const build = (lyrics) => partwise([{ id: 'P1', name: 'Piano', measures: [0, 1, 2, 3].map((i) => M((i ? '' : attrs({ staves: 3 }))
+    + ['E4', 'D4', 'C4', 'D4'].map((p) => N(p, 1, { staff: 1, voice: 1, lyric: lyrics ? 'la' : undefined })).join('') + backup(4)
+    + CH(['E4', 'G4', 'C5'], 2, { staff: 2, voice: 5 }) + CH(['F4', 'A4', 'C5'], 2, { staff: 2, voice: 5 }) + backup(4)
+    + N('C3', 2, { staff: 3, voice: 9 }) + N('F3', 2, { staff: 3, voice: 9 }))) }]);
+  const expected = { vocalKey: 'P1|s1|v1', playKeys: ['P1|s2|v5', 'P1|s3|v9'], hands: { 'P1|s2|v5': 'R', 'P1|s3|v9': 'L' } };
+  for (const lyrics of [true, false]) {
+    const score = parseMusicXml(build(lyrics));
+    assert.equal(score.parts[0].staves, 3);
+    const rec = recommendArrangement(score);
+    assert.deepEqual(rec, expected, `lyrics: ${lyrics}`);
+    const res = scoreToArrangement(score, rec);
+    assert.deepEqual(at(res.notes.filter((n) => n.h === 'R'), 0), [64, 67, 72], 'the chords are the right hand');
+    assert.deepEqual(at(res.notes.filter((n) => n.h === 'L'), 0), [48]);
+    assert.ok(!res.notes.some((n) => n.m === 62), 'the sung D4 is not played');
+    assert.equal(res.vocal.length, 16);
+  }
+});
+
+test('recommendArrangement without lyrics: a part that is one line on its own beats a higher right-hand line', () => {
+  const sung = [['E4', 'D4', 'C4', 'D4'], ['E4', 'E4', 'E4', 'R'], ['D4', 'D4', 'D4', 'R'], ['E4', 'G4', 'G4', 'R']];
+  const sungPart = { id: 'P1', name: 'MusicXML Part', measures: sung.map((ps, i) => M((i ? '' : attrs()) + ps.map((p) => N(p, 1)).join(''))) };
+  const bassPart = (id) => ({ id, name: 'MusicXML Part', measures: [0, 1, 2, 3].map((i) => M((i ? '' : attrs()) + N('C3', 2) + N('F2', 2))) });
+  // (a) right hand as broken-chord eighths (single notes, one voice), higher on average than the sung line
+  const broken = ['C4', 'G4', 'E5', 'G4', 'F4', 'A4', 'F5', 'A4'];
+  const a = parseMusicXml(partwise([
+    sungPart,
+    { id: 'P2', name: 'MusicXML Part', measures: [0, 1, 2, 3].map((i) => M((i ? '' : attrs({ div: 2 })) + broken.map((p) => N(p, 1)).join(''))) },
+    bassPart('P3'),
+  ]));
+  const trackOf = (score, key) => score.parts.flatMap((p) => p.tracks).find((t) => t.key === key);
+  assert.ok(trackOf(a, 'P2|s1|v1').avgPitch > trackOf(a, 'P1|s1|v1').avgPitch);
+  assert.deepEqual(recommendArrangement(a), {
+    vocalKey: 'P1|s1|v1', playKeys: ['P2|s1|v1', 'P3|s1|v1'], hands: { 'P2|s1|v1': 'R', 'P3|s1|v1': 'L' },
+  });
+
+  // (b) the OMR split the right hand into a top line (voice 1) and inner dyads (voice 2)
+  const rhVoices = { id: 'P2', name: 'MusicXML Part', measures: [0, 1, 2, 3].map((i) => M((i ? '' : attrs())
+    + ['C5', 'D5', 'E5', 'G5'].map((p) => N(p, 1, { voice: 1 })).join('') + backup(4)
+    + CH(['E4', 'G4'], 2, { voice: 2 }) + CH(['F4', 'A4'], 2, { voice: 2 }))) };
+  const b = parseMusicXml(partwise([sungPart, rhVoices, bassPart('P3')]));
+  assert.deepEqual(recommendArrangement(b), {
+    vocalKey: 'P1|s1|v1',
+    playKeys: ['P2|s1|v1', 'P2|s1|v2', 'P3|s1|v1'],
+    hands: { 'P2|s1|v1': 'R', 'P2|s1|v2': 'R', 'P3|s1|v1': 'L' },
+  });
+
+  // (c) a sung part and a grand-staff piano whose right hand has two voices, generic names
+  const piano = { id: 'P2', name: 'MusicXML Part', measures: [0, 1, 2, 3].map((i) => M((i ? '' : attrs({ staves: 2 }))
+    + ['C5', 'D5', 'E5', 'G5'].map((p) => N(p, 1, { staff: 1, voice: 1 })).join('') + backup(4)
+    + CH(['E4', 'G4'], 2, { staff: 1, voice: 2 }) + CH(['F4', 'A4'], 2, { staff: 1, voice: 2 }) + backup(4)
+    + N('C3', 2, { staff: 2, voice: 5 }) + N('G2', 2, { staff: 2, voice: 5 }))) };
+  const c = parseMusicXml(partwise([sungPart, piano]));
+  const rc = recommendArrangement(c);
+  assert.equal(rc.vocalKey, 'P1|s1|v1');
+  assert.deepEqual(rc.playKeys, ['P2|s1|v1', 'P2|s1|v2', 'P2|s2|v5']);
+  const res = scoreToArrangement(c, rc);
+  assert.deepEqual(res.vocal.slice(0, 4).map((n) => n.m), [64, 62, 60, 62]);
+  assert.deepEqual(at(res.notes.filter((n) => n.h === 'R'), 0), [64, 67, 72]);
+});
+
+test('recommendArrangement: one track, or nothing to play', () => {
+  const one = parseMusicXml(partwise([M(attrs() + N('C4', 2, { lyric: 'la' }) + N('E4', 2, { lyric: 'la' }))]));
+  assert.deepEqual(recommendArrangement(one), { vocalKey: 'P1|s1|v1', playKeys: ['P1|s1|v1'], hands: {} });
+  const plain = parseMusicXml(partwise([M(attrs() + N('C4', 2) + N('E4', 2))]));
+  assert.deepEqual(recommendArrangement(plain), { vocalKey: null, playKeys: ['P1|s1|v1'], hands: {} });
+  const empty = { vocalKey: null, playKeys: [], hands: {} };
+  assert.deepEqual(recommendArrangement(parseMusicXml(partwise([M(attrs() + R(4))]))), empty);
+  assert.deepEqual(recommendArrangement(null), empty);
+  assert.deepEqual(recommendArrangement({ parts: [] }), empty);
+});
+
+test('parts with the same name (OMR: every part "Piano") get their position in the label', () => {
+  const xml = partwise([
+    { id: 'P1', name: 'Piano', measures: [M(attrs() + N('E4', 1) + N('D4', 1) + N('C4', 2))] },
+    { id: 'P2', name: 'Piano', measures: [M(attrs() + N('C4', 4) + N('E4', 4, { chord: true }) + N('G4', 4, { chord: true }))] },
+    { id: 'P3', name: 'Strings', measures: [M(attrs() + N('C3', 4))] },
+  ]);
+  const score = parseMusicXml(xml);
+  assert.deepEqual(score.parts.map((p) => p.name), ['피아노 (파트 1)', '피아노 (파트 2)', 'Strings']);
+  assert.equal(score.parts[1].tracks[0].label, '피아노 (파트 2) · 1단 · 성부 1');
+  // The melody view counts the top line; allNotes / allMin / allMax count every chord tone.
+  const chords = score.parts[1].tracks[0];
+  assert.deepEqual([chords.noteCount, chords.min, chords.max], [1, 67, 67]);
+  assert.deepEqual([chords.allNotes, chords.allMin, chords.allMax], [3, 60, 67]);
 });

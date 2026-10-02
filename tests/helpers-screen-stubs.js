@@ -1,4 +1,4 @@
-// Lets node:test import screen modules (editor.js / calibrate.js) for their pure helpers.
+// Lets node:test import screen modules (editor.js / calibrate.js / play.js / home.js / results.js) for their pure helpers.
 // Browser-only dependencies (DOM helpers, Web Audio engine, synth) are replaced by inert stubs through a
 // module resolution hook, so the tests neither need a DOM nor depend on those files existing.
 import { register } from 'node:module';
@@ -16,6 +16,8 @@ const STUBS = {
     export const downloadFile = noop;
     export const pickFile = async () => null;
     export const formatTime = (s) => String(s);
+    export const formatNumber = (n) => String(Math.round(n));
+    export const listen = () => noop;
     export const escapeHtml = (s) => String(s);
   `,
   '/js/audio/engine.js': `

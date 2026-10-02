@@ -373,6 +373,7 @@ button.chip:hover { background: rgba(124, 92, 255, 0.24); }
 .badge.violet { color: #ddd6fe; background: rgba(124, 92, 255, 0.16); border-color: rgba(124, 92, 255, 0.4); }
 .badge.perfect { color: #1c1600; background: var(--perfect); border-color: transparent; }
 .badge.danger { color: #fecaca; background: rgba(239, 68, 68, 0.16); border-color: rgba(239, 68, 68, 0.45); }
+.badge.amber { color: #fde68a; background: rgba(251, 191, 36, 0.14); border-color: rgba(251, 191, 36, 0.42); }
 
 .notice {
   border-left: 4px solid var(--accent-2);
@@ -986,6 +987,8 @@ body[data-screen="play"] #toast-root {
 .song-art svg { width: 100%; height: 100%; }
 .song-art rect.w { fill: #5ee6fb; }
 .song-art rect.b { fill: #b49dff; }
+.song-art rect.lw { fill: #fbbf24; }
+.song-art rect.lb { fill: #f97316; }
 .song-art::after {
   content: "";
   position: absolute;
@@ -1260,6 +1263,7 @@ body[data-screen="play"] #toast-root {
 .grade-count { text-align: right; font-variant-numeric: tabular-nums; font-size: 1.1rem; }
 
 .results-counts .info-grid { margin-top: 16px; }
+.results-counts .unit-note { margin: 12px 0 0; }
 
 .timing-summary { margin-bottom: 14px; font-size: 1.15rem; font-weight: 900; }
 

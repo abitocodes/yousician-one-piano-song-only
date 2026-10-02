@@ -159,6 +159,34 @@ test('inputStateAction: pause on a dead input, explain failures, clear when runn
   }
 });
 
+test('accompaniment helpers: arrangement, sung melody and the guide toggle label', () => {
+  const acc = { arrangement: 'accompaniment', notes: [], vocal: [{ t: 1, d: 0.5, m: 72 }] };
+  assert.equal(play.isAccompaniment(acc), true);
+  assert.equal(play.isAccompaniment({ arrangement: 'melody' }), false);
+  assert.equal(play.isAccompaniment({}), false);
+  assert.equal(play.isAccompaniment(null), false);
+  assert.equal(play.hasVocal(acc), true);
+  assert.equal(play.hasVocal({ vocal: [] }), false);
+  assert.equal(play.hasVocal({}), false);
+  assert.equal(play.guideLabel(acc), '노래 멜로디 듣기 (이어폰 권장)');
+  assert.equal(play.guideLabel({ arrangement: 'accompaniment', vocal: [] }), '가이드 멜로디');
+  assert.equal(play.guideLabel({ notes: [] }), '가이드 멜로디');
+});
+
+test('holdHintParts: melody holds name the notes; accompaniment holds ask for any one of the chord', () => {
+  assert.deepEqual(play.holdHintParts([60], { labelStyle: 'solfege' }), ['도 (C4)', ' 을 쳐주세요']);
+  assert.deepEqual(play.holdHintParts([64, 60, 60.2], { labelStyle: 'en' }), ['C4 · E4', ' 건반을 쳐주세요']);
+  assert.deepEqual(play.holdHintParts([67], { labelStyle: 'solfege', accompaniment: true }), ['솔 (G4)', ' 을 쳐주세요']);
+  assert.deepEqual(play.holdHintParts([48, 64], { labelStyle: 'solfege', accompaniment: true }),
+    ['도 (C3) · 미 (E4)', ' 중 하나를 쳐주세요']);
+  // Long chords use compact names so the banner fits.
+  assert.deepEqual(play.holdHintParts([67, 48, 60, 64], { labelStyle: 'solfege', accompaniment: true }),
+    ['도3 · 도4 · 미4 · 솔4', ' 중 하나를 쳐주세요']);
+  assert.deepEqual(play.holdHintParts([48, 55, 64], { labelStyle: 'en', accompaniment: true }),
+    ['C3 · G3 · E4', ' 중 하나를 쳐주세요']);
+  assert.deepEqual(play.holdHintParts([], {}), ['', ' 을 쳐주세요']);
+});
+
 test('acceptsKeys: screen keys / keyboard only in play and practice', () => {
   assert.equal(play.acceptsKeys('play'), true);
   assert.equal(play.acceptsKeys('practice'), true);

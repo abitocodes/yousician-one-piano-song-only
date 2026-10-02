@@ -22,6 +22,16 @@ const MODE_LABEL = { play: '플레이', practice: '연습 모드', listen: '듣�
 
 let rafId = 0;
 
+/**
+ * What one judged unit is: two-hand accompaniment songs are judged per chord (onset group), others per note.
+ * → { unit: '화음' | '노트', subject (with its particle), title }
+ */
+export function judgeUnit(song) {
+  return song && song.arrangement === 'accompaniment'
+    ? { unit: '화음', subject: '화음이', title: '판정 (화음 단위)' }
+    : { unit: '노트', subject: '노트가', title: '판정' };
+}
+
 function timingSummary(meanDelta, count) {
   if (!count || !Number.isFinite(meanDelta)) return '타이밍 데이터가 없어요';
   const v = Math.round(meanDelta * 1000);
@@ -147,11 +157,15 @@ export async function mount(root, params, app) {
       h('span', { class: 'grade-count' }, String(c)));
   });
 
+  const unit = judgeUnit(song);
   const countsCard = h('section', { class: 'card results-counts' },
-    h('h2', { class: 'group-title' }, '판정'),
+    h('h2', { class: 'group-title' }, unit.title),
     h('div', { class: 'stack' }, gradeRows),
+    unit.unit === '화음'
+      ? h('p', { class: 'muted small unit-note' }, '양손 반주는 같은 박의 화음을 하나로 세요. 아주 낮은 음은 판정하지 않아요.')
+      : null,
     h('div', { class: 'info-grid' },
-      h('div', { class: 'info-row' }, h('span', { class: 'muted' }, '판정한 노트'), h('span', {}, `${stats.judged ?? total} / ${total}`)),
+      h('div', { class: 'info-row' }, h('span', { class: 'muted' }, `판정한 ${unit.unit}`), h('span', {}, `${stats.judged ?? total} / ${total}`)),
       h('div', { class: 'info-row' }, h('span', { class: 'muted' }, '최대 콤보'), h('span', {}, String(stats.maxCombo || 0))),
       h('div', { class: 'info-row' }, h('span', { class: 'muted' }, '노트 밖 입력'), h('span', {}, `${stats.stray || 0}회`))));
 
@@ -164,7 +178,7 @@ export async function mount(root, params, app) {
   const timingCard = h('section', { class: 'card results-timing' },
     h('h2', { class: 'group-title' }, '타이밍'),
     h('div', { class: 'timing-summary' }, timingSummary(stats.meanDelta, deltas.length)),
-    deltas.length ? histogram(deltas, difficulty) : h('p', { class: 'muted small' }, '맞힌 노트가 없어서 타이밍 그래프를 그릴 수 없어요.'),
+    deltas.length ? histogram(deltas, difficulty) : h('p', { class: 'muted small' }, `맞힌 ${unit.subject} 없어서 타이밍 그래프를 그릴 수 없어요.`),
     latencyHint);
 
   const otherMode = mode === 'practice' ? 'play' : 'practice';

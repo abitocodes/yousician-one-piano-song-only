@@ -924,3 +924,409 @@ test('screen module exports mount/unmount/onBack', () => {
   assert.equal(ed.onBack(), false); // nothing mounted → let the router handle back
   ed.unmount();
 });
+
+// --- 양손 반주 + 노래 멜로디 (original made-up material only) -----------------------------
+
+const { lyricTimingNotes, normalizeSong } = await import('../js/core/song.js');
+const { assignLyrics: assignLyricsFn } = await import('../js/core/lyrics.js');
+const { JUDGE_FLOOR } = await import('../js/core/arrange.js');
+
+/** C major block chords (right hand) + bass octaves (left hand), one per beat at 120 BPM. */
+const chordAccomp = () => [
+  { t: 0, d: 0.5, m: 60, h: 'R' }, { t: 0, d: 0.5, m: 64, h: 'R' }, { t: 0, d: 0.5, m: 67, h: 'R' }, { t: 0, d: 0.5, m: 72, h: 'R' },
+  { t: 0, d: 1, m: 36, h: 'L' }, { t: 0, d: 1, m: 48, h: 'L' },
+  { t: 0.5, d: 0.5, m: 60, h: 'R' }, { t: 0.5, d: 0.5, m: 65, h: 'R' }, { t: 0.5, d: 0.5, m: 69, h: 'R' },
+  { t: 1, d: 1, m: 59, h: 'R' }, { t: 1, d: 1, m: 62, h: 'R' }, { t: 1, d: 1, m: 67, h: 'R' },
+  { t: 1, d: 1, m: 43, h: 'L' }, { t: 1, d: 1, m: 55, h: 'L' },
+];
+const laLine = () => [{ t: 0, d: 0.5, m: 72 }, { t: 0.5, d: 0.5, m: 74 }, { t: 1, d: 0.5, m: 76 }, { t: 1.5, d: 0.5, m: 72 }];
+
+test('simplifyParams: chord options map to per-hand limits (전부 = Infinity)', () => {
+  assert.deepEqual(ed.simplifyParams({ right: 'all', left: 'all' }), { right: Infinity, left: Infinity });
+  assert.deepEqual(ed.simplifyParams({ right: 3, left: 2 }), { right: 3, left: 2 });
+  assert.deepEqual(ed.simplifyParams({ right: '1', left: 1 }), { right: 1, left: 1 });
+  assert.deepEqual(ed.simplifyParams({ right: 0, left: 'x' }), { right: Infinity, left: Infinity });
+  assert.deepEqual(ed.simplifyParams(), { right: Infinity, left: Infinity });
+  // the option lists offer exactly the documented choices; defaults are among them
+  assert.deepEqual(ed.RIGHT_HAND_OPTIONS.map((o) => o.value), ['all', 3, 2, 1]);
+  assert.deepEqual(ed.LEFT_HAND_OPTIONS.map((o) => o.value), ['all', 2, 1]);
+  assert.ok(ed.RIGHT_HAND_OPTIONS.some((o) => o.value === ed.DEFAULT_SIMPLIFY.right));
+  assert.ok(ed.LEFT_HAND_OPTIONS.some((o) => o.value === ed.DEFAULT_SIMPLIFY.left));
+});
+
+test('prepareImportNotes: transposes, folds out-of-range notes by octaves (count kept), keeps hand tags', () => {
+  const { notes, moved } = ed.prepareImportNotes([
+    { t: 1, d: 0.5, m: 107, h: 'R' },
+    { t: -0.01, d: 0.01, m: 22, h: 'L' },
+    { t: 0.5, m: 60, h: 'x', v: 0.3 },
+    { t: NaN, d: 1, m: 60 },
+    null,
+  ], 3);
+  assert.equal(moved, 1);
+  assert.deepEqual(notes.map((n) => [n.t, n.d, n.m, n.h]), [
+    [0, 0.05, 25, 'L'],
+    [0.5, 0.25, 63, undefined],
+    [1, 0.5, 98, 'R'], // 110 → one octave down
+  ]);
+  assert.equal(notes[1].v, 0.3);
+  assert.equal(notes[0].v, 0.8);
+  assert.equal(Object.prototype.hasOwnProperty.call(notes[1], 'h'), false);
+  assert.deepEqual(ed.prepareImportNotes(null).notes, []);
+});
+
+test('arrangementDraftParts: transposes accompaniment and sung melody together, simplifies chords per hand', () => {
+  const res = { notes: chordAccomp(), vocal: laLine() };
+  const all = ed.arrangementDraftParts(res);
+  assert.equal(all.notes.length, 14);
+  assert.deepEqual([all.stats.right, all.stats.left], [10, 4]);
+  assert.equal(all.stats.belowFloor, 1); // C2
+  assert.equal(all.vocal.length, 4);
+  assert.equal(all.end, 2);
+
+  const easy = ed.arrangementDraftParts(res, { right: 2, left: 1 });
+  // right hand keeps the top two notes of each chord, left hand only the bass
+  const at = (t, h) => easy.notes.filter((n) => n.t === t && n.h === h).map((n) => n.m);
+  assert.deepEqual(at(0, 'R'), [67, 72]);
+  assert.deepEqual(at(0.5, 'R'), [65, 69]);
+  assert.deepEqual(at(1, 'R'), [62, 67]);
+  assert.deepEqual(at(0, 'L'), [36]);
+  assert.deepEqual(at(1, 'L'), [43]);
+  assert.deepEqual([easy.stats.right, easy.stats.left], [6, 2]);
+  assert.equal(easy.vocal.length, 4, 'the sung melody is never simplified');
+
+  const up = ed.arrangementDraftParts(res, { transpose: 2, right: 1, left: 'all' });
+  assert.deepEqual(up.vocal.map((n) => n.m), [74, 76, 78, 74]);
+  assert.deepEqual(up.notes.filter((n) => n.h === 'R').map((n) => n.m), [74, 71, 69]);
+  assert.equal(res.notes[0].m, 60, 'input not mutated');
+  // every note keeps its hand and the list is sorted by time then pitch
+  for (let i = 1; i < up.notes.length; i++) {
+    const a = up.notes[i - 1];
+    const b = up.notes[i];
+    assert.ok(a.t < b.t || (a.t === b.t && a.m <= b.m));
+  }
+  assert.ok(up.notes.every((n) => n.h === 'R' || n.h === 'L'));
+  assert.deepEqual(ed.arrangementDraftParts({ notes: [], vocal: [] }).notes, []);
+});
+
+test('arrangementSummaryText / arrangementNotices / joinReplacing', () => {
+  assert.equal(ed.arrangementSummaryText({ right: 12, left: 5, vocal: 8, syllables: 8, end: 75.4 }),
+    '오른손 12 · 왼손 5 · 노래 8음 · 가사 8음절 · 길이 1:15');
+  assert.deepEqual(ed.arrangementNotices({ stats: { right: 3, left: 2, belowFloor: 0 }, hasVocal: true, scoreLyrics: true }), []);
+  const low = ed.arrangementNotices({ stats: { right: 3, left: 2, belowFloor: 4 }, hasVocal: false });
+  assert.equal(low.length, 1);
+  assert.match(low[0], /4개.*판정하지 않아요/);
+  assert.match(ed.arrangementNotices({ stats: { right: 3, left: 0 } })[0], /왼손 노트가 없어요/);
+  assert.match(ed.arrangementNotices({ stats: { right: 0, left: 3 } })[0], /오른손 노트가 없어요/);
+  assert.match(ed.arrangementNotices({ stats: { right: 1, left: 1 }, hasVocal: true })[0], /붙여넣으면 노래 멜로디/);
+  assert.match(ed.arrangementNotices({ stats: { right: 1, left: 1 }, hasVocal: true, keptLyrics: true })[0], /지금 가사를 그대로/);
+  assert.match(ed.arrangementNotices({ stats: { right: 1, left: 1 }, hasVocal: true, vocalHasLyrics: true })[0], /가져오지 않아요/);
+  assert.equal(ed.joinReplacing(['지금 노트 3개']), '지금 노트 3개');
+  assert.equal(ed.joinReplacing(['지금 노트 3개', '가사']), '지금 노트 3개와 가사');
+  assert.equal(ed.joinReplacing(['지금 노트 3개', '노래 멜로디', '가사']), '지금 노트 3개, 노래 멜로디와 가사');
+  assert.equal(ed.joinReplacing([]), '');
+});
+
+test('applyArrangementImport: score lyrics replace; otherwise pasted lyrics stay and follow the sung melody', () => {
+  const parts = ed.arrangementDraftParts({ notes: chordAccomp(), vocal: laLine() }, { right: 3, left: 2 });
+  const d = { ...songDraft(), lyrics: { text: '하나 둘 셋', source: 'notes', lines: [] } };
+  ed.applyArrangementImport(d, { notes: parts.notes, vocal: parts.vocal, bpm: 120.004, beatsPerBar: 3, offset: 0 });
+  assert.equal(d.arrangement, 'accompaniment');
+  assert.equal(d.notes, parts.notes);
+  assert.equal(d.vocal, parts.vocal);
+  assert.equal(d.bpm, 120);
+  assert.equal(d.beatsPerBar, 3);
+  assert.equal(d.offset, 0);
+  assert.equal(d.lyrics.text, '하나 둘 셋', 'no score lyrics → the pasted lyrics are kept');
+  // lyrics are timed against the sung melody, not the chords
+  assert.equal(lyricTimingNotes(d), d.vocal);
+  const placed = assignLyricsFn('하나 둘 셋', lyricTimingNotes(d));
+  assert.deepEqual(placed.warnings, []);
+  assert.deepEqual(placed.lines[0].syllables.map((y) => y.t), [0, 0.5, 1, 1.5]);
+
+  ed.applyArrangementImport(d, { notes: parts.notes, vocal: parts.vocal, bpm: 90, beatsPerBar: 4, lyricText: 'la la la la' });
+  assert.deepEqual(d.lyrics, { text: 'la la la la', source: 'notes', lines: [] });
+  // an LRC lyric stays when the score has no lyrics
+  const lrc = { ...songDraft(), lyrics: { text: '하나', source: 'lrc', lines: [{ syllables: [{ text: '하나', t: 1, d: 1 }] }] } };
+  ed.applyArrangementImport(lrc, { notes: parts.notes, vocal: [], bpm: 0, beatsPerBar: 0 });
+  assert.equal(lrc.lyrics.source, 'lrc');
+  assert.equal(lrc.bpm, 100, 'invalid bpm/beats leave the old values');
+  assert.equal(lrc.beatsPerBar, 4);
+
+  // a melody import afterwards drops the sung melody and judges single notes again
+  ed.applyMelodyImport(d, { notes: laLine(), bpm: 100, beatsPerBar: 4, offset: 0.5, lyricText: '' });
+  assert.equal(d.arrangement, 'melody');
+  assert.deepEqual(d.vocal, []);
+  assert.equal(d.offset, 0.5);
+  assert.equal(d.lyrics.text, 'la la la la');
+  assert.equal(lyricTimingNotes(d), d.notes);
+});
+
+test('note tools apply to the sung melody too (transpose range, map, tempo, trim)', () => {
+  const d = { ...songDraft(), notes: chordAccomp(), vocal: laLine() };
+  // the range check covers the sung melody as well as the chords
+  assert.deepEqual(ed.draftNoteRange(d), { min: 36, max: 76 });
+  assert.deepEqual(ed.draftNoteRange({ notes: [{ t: 0, d: 1, m: 50 }] }), { min: 50, max: 50 });
+  const up = ed.mapDraftNotes(d, (list) => list.map((n) => ({ ...n, m: n.m + 12 })));
+  assert.deepEqual(up.vocal.map((n) => n.m), [84, 86, 88, 84]);
+  assert.equal(up.notes.length, d.notes.length);
+  assert.equal(up.notes[0].h, d.notes[0].h);
+  let calls = 0;
+  assert.deepEqual(ed.mapDraftNotes({ notes: [] }, (list) => { calls++; return list; }), { notes: [], vocal: [] });
+  assert.equal(calls, 1, 'an empty sung melody is not transformed');
+
+  const slow = ed.scaleTempo({ ...d, bpm: 120 }, 60);
+  assert.deepEqual(slow.vocal.map((n) => n.t), [0, 1, 2, 3]);
+  assert.deepEqual(ed.scaleTempo(songDraft(), 50).vocal, []);
+
+  // the sung pickup starts before the piano: trimming keeps the gap between them
+  const late = { ...songDraft(), notes: [{ t: 3, d: 1, m: 60, h: 'R' }], vocal: [{ t: 2.5, d: 0.5, m: 72 }, { t: 3, d: 1, m: 74 }] };
+  const r = ed.trimLeadingSilence(late);
+  assert.equal(r.shift, -2.5);
+  assert.deepEqual(r.vocal.map((n) => n.t), [0, 0.5]);
+  assert.deepEqual(r.notes.map((n) => [n.t, n.h]), [[0.5, 'R']]);
+  assert.equal(r.offset, -2.5);
+  assert.deepEqual(ed.trimLeadingSilence({ ...songDraft(), notes: [{ t: 1, d: 1, m: 60 }] }).vocal, []);
+});
+
+test('replacing notes (record / step entry / text / MIDI): keep the vocal by default, dropping it makes one line a melody', () => {
+  const acc = { ...songDraft(), arrangement: 'accompaniment', notes: chordAccomp(), vocal: laLine() };
+  const line = laLine();
+  assert.equal(ed.isSingleLine(line), true);
+  assert.equal(ed.isSingleLine(chordAccomp()), false);
+  assert.equal(ed.isSingleLine([]), true);
+
+  const kept = ed.arrangementAfterReplace(acc, line);
+  assert.equal(kept.vocal, acc.vocal);
+  assert.equal(kept.arrangement, 'accompaniment');
+  assert.deepEqual(ed.arrangementAfterReplace(acc, line, { keepVocal: false }), { vocal: [], arrangement: 'melody' });
+  assert.deepEqual(ed.arrangementAfterReplace(acc, chordAccomp(), { keepVocal: false }), { vocal: [], arrangement: 'accompaniment' });
+  // an accompaniment draft without a sung melody that becomes one line is a melody again
+  assert.deepEqual(ed.arrangementAfterReplace({ ...acc, vocal: [] }, line), { vocal: [], arrangement: 'melody' });
+  // plain melody songs are untouched
+  assert.deepEqual(ed.arrangementAfterReplace(songDraft(), chordAccomp(), { keepVocal: false }), { vocal: [], arrangement: 'melody' });
+});
+
+test('switchArrangement: to accompaniment tags hands at middle C when untagged; back to melody keeps notes', () => {
+  const plain = { ...songDraft(), notes: [{ t: 0, d: 1, m: 48 }, { t: 0, d: 1, m: 64 }, { t: 1, d: 1, m: 60 }] };
+  const acc = ed.switchArrangement(plain, 'accompaniment');
+  assert.equal(acc.arrangement, 'accompaniment');
+  assert.deepEqual(acc.notes.map((n) => [n.m, n.h]), [[48, 'L'], [64, 'R'], [60, 'R']]);
+  assert.equal(plain.notes[0].h, undefined, 'input not mutated');
+  assert.equal(ed.hasHandTags(acc.notes), true);
+  assert.equal(ed.hasHandTags(plain.notes), false);
+  const tagged = { ...plain, notes: acc.notes };
+  assert.equal(ed.switchArrangement(tagged, 'accompaniment').notes, tagged.notes);
+  const back = ed.switchArrangement(tagged, 'melody');
+  assert.equal(back.arrangement, 'melody');
+  assert.equal(back.notes, tagged.notes);
+  assert.deepEqual(ed.switchArrangement({ notes: [] }, 'accompaniment'), { arrangement: 'accompaniment', notes: [] });
+});
+
+test('ensureHandTags: notes entered into an accompaniment get a hand (split at middle C), existing tags win', () => {
+  const mixed = [{ t: 0, d: 1, m: 55, h: 'R' }, { t: 0, d: 1, m: 50 }, { t: 1, d: 1, m: 72 }, { t: 1, d: 1, m: 70, h: 'L' }];
+  const tagged = ed.ensureHandTags(mixed, 'accompaniment');
+  assert.deepEqual(tagged.map((n) => [n.m, n.h]), [[50, 'L'], [55, 'R'], [70, 'L'], [72, 'R']]);
+  assert.equal(mixed[1].h, undefined, 'input not mutated');
+  assert.equal(ed.ensureHandTags(tagged, 'accompaniment'), tagged, 'fully tagged → same list');
+  assert.equal(ed.ensureHandTags(mixed, 'melody'), mixed, 'melody songs are left alone');
+  assert.deepEqual(ed.ensureHandTags(null, 'accompaniment'), []);
+  // partially tagged notes are completed when switching to accompaniment as well
+  assert.ok(ed.switchArrangement({ notes: mixed }, 'accompaniment').notes.every((n) => n.h === 'R' || n.h === 'L'));
+});
+
+test('arrangementSelection / arrangementRequest: sanitize the recommendation and build a stable request', () => {
+  const tracks = [{ key: 'P1|s1|v1' }, { key: 'P2|s1|v1' }, { key: 'P3|s1|v5' }];
+  const sel = ed.arrangementSelection(tracks, {
+    vocalKey: 'P1|s1|v1',
+    playKeys: ['P2|s1|v1', 'P3|s1|v5', 'P9|s1|v1', 'P2|s1|v1'],
+    hands: { 'P2|s1|v1': 'R', 'P3|s1|v5': 'L', 'P1|s1|v1': 'R' },
+  });
+  assert.deepEqual(sel, { vocalKey: 'P1|s1|v1', playKeys: ['P2|s1|v1', 'P3|s1|v5'], hands: { 'P2|s1|v1': 'R', 'P3|s1|v5': 'L' } });
+  assert.deepEqual(ed.arrangementSelection(tracks, null), { vocalKey: null, playKeys: [], hands: {} });
+  assert.equal(ed.arrangementSelection(tracks, { vocalKey: 'nope' }).vocalKey, null);
+
+  const req = ed.arrangementRequest({
+    vocalKey: 'P1|s1|v1',
+    playKeys: ['P3|s1|v5', 'P2|s1|v1', 'P3|s1|v5'],
+    hands: { 'P3|s1|v5': 'L', 'P2|s1|v1': 'auto', 'P1|s1|v1': 'R' },
+    verse: '2',
+    includeLyrics: 1,
+    unfoldRepeats: false,
+  });
+  assert.deepEqual(req, {
+    vocalKey: 'P1|s1|v1', playKeys: ['P2|s1|v1', 'P3|s1|v5'], hands: { 'P3|s1|v5': 'L' }, verse: 2, includeLyrics: true, unfoldRepeats: false,
+  });
+  // the same choice in another order is the same request (cache key)
+  assert.equal(JSON.stringify(ed.arrangementRequest({ playKeys: ['b', 'a'] })), JSON.stringify(ed.arrangementRequest({ playKeys: ['a', 'b'] })));
+  assert.equal(ed.arrangementRequest({ playKeys: ['a'], bpm: 88 }).bpm, 88);
+  assert.equal('bpm' in ed.arrangementRequest({ playKeys: ['a'], bpm: undefined }), false);
+  assert.equal(ed.arrangementRequest({ playKeys: ['a'], verse: 'auto' }).verse, 'auto');
+  assert.equal(ed.arrangementRequest({ vocalKey: '' }).vocalKey, null);
+});
+
+test('melodyTrackChoice: without lyrics the melody tab recommends the same sung line as the accompaniment tab', () => {
+  const tracks = [
+    { key: 'P1|s1|v1', lyricCount: 0 }, { key: 'P2|s1|v1', lyricCount: 0 }, { key: 'P3|s1|v1', lyricCount: 0 },
+  ];
+  const arr = { vocalKey: 'P1|s1|v1', playKeys: ['P2|s1|v1', 'P3|s1|v1'], hands: {} };
+  assert.equal(ed.melodyTrackChoice(tracks, 'P2|s1|v1', arr), 'P1|s1|v1');
+  // lyrics in the score: recommendTrack's choice stays (it follows the lyrics)
+  const withLyrics = tracks.map((t, i) => ({ ...t, lyricCount: i === 1 ? 8 : 0 }));
+  assert.equal(ed.melodyTrackChoice(withLyrics, 'P2|s1|v1', { ...arr, vocalKey: 'P2|s1|v1' }), 'P2|s1|v1');
+  // no accompaniment recommendation / unknown keys
+  assert.equal(ed.melodyTrackChoice(tracks, 'P2|s1|v1', { vocalKey: null }), 'P2|s1|v1');
+  assert.equal(ed.melodyTrackChoice(tracks, 'P2|s1|v1', null), 'P2|s1|v1');
+  assert.equal(ed.melodyTrackChoice(tracks, 'P9|s1|v1', { vocalKey: 'P8|s1|v1' }), 'P1|s1|v1');
+  assert.equal(ed.melodyTrackChoice([], 'x', null), null);
+});
+
+test('melodyTrackChoice on a 3-part OMR score without lyrics agrees with the accompaniment recommendation', async () => {
+  const mx = await import('../js/core/musicxml.js');
+  const note = (p, oct, dur, chord = false) => `<note>${chord ? '<chord/>' : ''}<pitch><step>${p}</step><octave>${oct}</octave></pitch>`
+    + `<duration>${dur}</duration><voice>1</voice></note>`;
+  const chord = (ps, oct, dur) => ps.map((p, k) => note(p, oct, dur, k > 0)).join('');
+  const attrs = '<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>';
+  const part = (id, bars) => `<part id="${id}">${bars.map((b, i) => `<measure number="${i + 1}">${i ? '' : attrs}${b}</measure>`).join('')}</part>`;
+  const sung = [['E', 'D', 'C', 'D'], ['E', 'E', 'E', 'D'], ['D', 'D', 'E', 'D'], ['C', 'D', 'E', 'C']];
+  const xml = '<?xml version="1.0" encoding="UTF-8"?><score-partwise version="3.1"><part-list>'
+    + ['P1', 'P2', 'P3'].map((id) => `<score-part id="${id}"><part-name>MusicXML Part</part-name></score-part>`).join('')
+    + '</part-list>'
+    + part('P1', sung.map((ps) => ps.map((p) => note(p, 4, 1)).join('')))
+    + part('P2', sung.map(() => chord(['E', 'G'], 4, 2) + note('C', 5, 2, true) + chord(['F', 'A'], 4, 2) + note('C', 5, 2, true)))
+    + part('P3', sung.map(() => note('C', 3, 2) + note('F', 2, 2)))
+    + '</score-partwise>';
+  const score = mx.parseMusicXml(xml);
+  const tracks = score.parts.flatMap((p) => p.tracks).filter((t) => t.noteCount > 0);
+  const arr = ed.arrangementSelection(tracks, mx.recommendArrangement(score));
+  assert.equal(arr.vocalKey, 'P1|s1|v1');
+  assert.equal(mx.recommendTrack(score), 'P2|s1|v1', 'the plain melody heuristic picks the chords\' top line');
+  assert.equal(ed.melodyTrackChoice(tracks, mx.recommendTrack(score), arr), 'P1|s1|v1');
+});
+
+test('arrangementVocalChange: the new sung line leaves 「연주」 and the previous one takes its place and hand', () => {
+  const mono = (key) => ({ key, noteCount: 16, allNotes: 16 });
+  const tracks = [mono('P1|s1|v1'), mono('P2|s1|v1'), { key: 'P3|s1|v1', noteCount: 8, allNotes: 8 }];
+  // The recommendation took the right hand (P2) for the sung line: the user picks P1 instead.
+  const rec = { vocalKey: 'P2|s1|v1', playKeys: ['P1|s1|v1', 'P3|s1|v1'], hands: { 'P1|s1|v1': 'R', 'P3|s1|v1': 'L' } };
+  const st = { vocalKey: rec.vocalKey, play: [...rec.playKeys], hands: { ...rec.hands } };
+  const next = ed.arrangementVocalChange(st, 'P1|s1|v1', { tracks, rec });
+  assert.deepEqual(next, {
+    vocalKey: 'P1|s1|v1', play: ['P3|s1|v1', 'P2|s1|v1'], hands: { 'P1|s1|v1': 'R', 'P3|s1|v1': 'L', 'P2|s1|v1': 'R' },
+  });
+  assert.deepEqual(st.play, rec.playKeys, 'the input is not mutated');
+  // and back again
+  const back = ed.arrangementVocalChange(next, 'P2|s1|v1', { tracks, rec });
+  assert.equal(back.vocalKey, 'P2|s1|v1');
+  assert.deepEqual([...back.play].sort(), ['P1|s1|v1', 'P3|s1|v1']);
+  assert.equal(back.hands['P1|s1|v1'], 'R');
+  // a track with an automatic hand passes that on
+  const auto = ed.arrangementVocalChange({ vocalKey: 'P2|s1|v1', play: ['P1|s1|v1'], hands: { 'P2|s1|v1': 'L' } }, 'P1|s1|v1', { tracks });
+  assert.deepEqual(auto, { vocalKey: 'P1|s1|v1', play: ['P2|s1|v1'], hands: {} });
+
+  // 「없음」 or a track that is not played: nothing else changes
+  assert.deepEqual(ed.arrangementVocalChange(st, null, { tracks, rec }), { vocalKey: null, play: st.play, hands: st.hands });
+  const notPlayed = ed.arrangementVocalChange({ vocalKey: null, play: ['P3|s1|v1'], hands: {} }, 'P1|s1|v1', { tracks, rec });
+  assert.deepEqual(notPlayed, { vocalKey: 'P1|s1|v1', play: ['P3|s1|v1'], hands: {} });
+  assert.equal(ed.arrangementVocalChange(st, 'nope', { tracks, rec }).vocalKey, null);
+
+  // piano staves stay played: a chord staff, or the solo-piano melody staff the recommendation plays as well
+  const chordRh = { key: 'P1|s1|v1', noteCount: 8, allNotes: 24 };
+  const keep = ed.arrangementVocalChange({ vocalKey: null, play: ['P1|s1|v1', 'P1|s2|v5'], hands: {} }, 'P1|s1|v1',
+    { tracks: [chordRh, { key: 'P1|s2|v5', noteCount: 8, allNotes: 8 }] });
+  assert.deepEqual(keep.play, ['P1|s1|v1', 'P1|s2|v5']);
+  const solo = { vocalKey: 'P1|s1|v1', playKeys: ['P1|s1|v1', 'P1|s2|v5'] };
+  const again = ed.arrangementVocalChange({ vocalKey: null, play: ['P1|s1|v1', 'P1|s2|v5'], hands: {} }, 'P1|s1|v1',
+    { tracks: [mono('P1|s1|v1'), mono('P1|s2|v5')], rec: solo });
+  assert.deepEqual(again.play, ['P1|s1|v1', 'P1|s2|v5']);
+});
+
+test('undo restores the sung melody and the judging mode; old snapshots leave them alone', () => {
+  const d = { ...songDraft(), arrangement: 'accompaniment', notes: chordAccomp(), vocal: laLine() };
+  const snap = ed.makeUndoSnapshot(d, '노래 멜로디 지우기');
+  d.vocal = [];
+  d.arrangement = 'melody';
+  ed.sealUndoSnapshot(snap, d);
+  ed.applyUndoSnapshot(d, snap);
+  assert.equal(d.vocal.length, 4);
+  assert.equal(d.arrangement, 'accompaniment');
+  assert.equal(d.notes[0].h, 'R', 'hand tags survive the snapshot copy');
+  // the snapshot is a copy
+  const s2 = ed.makeUndoSnapshot(d, 'x');
+  d.vocal[0].m = 1;
+  assert.equal(s2.vocal[0].m, 72);
+  // snapshots from before this feature (no vocal / arrangement) keep the current values
+  const cur = { ...songDraft(), arrangement: 'accompaniment', vocal: laLine() };
+  ed.applyUndoSnapshot(cur, { label: 'old', notes: [{ t: 0, d: 1, m: 60 }] });
+  assert.equal(cur.vocal.length, 4);
+  assert.equal(cur.arrangement, 'accompaniment');
+  // a draft without the fields snapshots as melody with no vocal
+  const plain = ed.makeUndoSnapshot(songDraft(), 'y');
+  assert.deepEqual(plain.vocal, []);
+  assert.equal(plain.arrangement, 'melody');
+});
+
+test('MusicXML 3-part piano-vocal score → accompaniment draft (original 2-bar tune, no tempo mark)', async (t) => {
+  const mx = await import('../js/core/musicxml.js');
+  if (typeof mx.scoreToArrangement !== 'function' || typeof mx.recommendArrangement !== 'function') {
+    t.skip('scoreToArrangement is not available');
+    return;
+  }
+  const note = (step, oct, dur, type, { word = '', chord = false } = {}) => `<note>${chord ? '<chord/>' : ''}`
+    + `<pitch><step>${step}</step><octave>${oct}</octave></pitch><duration>${dur}</duration><voice>1</voice><type>${type}</type>`
+    + `${word ? `<lyric number="1"><syllabic>single</syllabic><text>${word}</text></lyric>` : ''}</note>`;
+  const attrs = '<attributes><divisions>1</divisions><time><beats>4</beats><beat-type>4</beat-type></time></attributes>';
+  const part = (id, m1, m2) => `<part id="${id}"><measure number="1">${attrs}${m1}</measure><measure number="2">${m2}</measure></part>`;
+  const xml = '<?xml version="1.0" encoding="UTF-8"?><score-partwise version="3.1">'
+    + '<work><work-title>연습 반주</work-title></work><part-list>'
+    + '<score-part id="P1"><part-name>Voice</part-name></score-part>'
+    + '<score-part id="P2"><part-name>Piano</part-name></score-part>'
+    + '<score-part id="P3"><part-name>Piano</part-name></score-part></part-list>'
+    + part('P1',
+      note('C', 5, 1, 'quarter', { word: '하' }) + note('D', 5, 1, 'quarter', { word: '나' }) + note('E', 5, 2, 'half', { word: '둘' }),
+      note('G', 4, 4, 'whole', { word: '셋' }))
+    + part('P2',
+      note('C', 4, 2, 'half') + note('E', 4, 2, 'half', { chord: true }) + note('G', 4, 2, 'half', { chord: true })
+      + note('C', 4, 2, 'half') + note('F', 4, 2, 'half', { chord: true }) + note('A', 4, 2, 'half', { chord: true }),
+      note('B', 3, 4, 'whole') + note('D', 4, 4, 'whole', { chord: true }) + note('G', 4, 4, 'whole', { chord: true }))
+    + part('P3',
+      note('C', 2, 4, 'whole') + note('C', 3, 4, 'whole', { chord: true }),
+      note('G', 2, 4, 'whole'))
+    + '</score-partwise>';
+  const score = mx.parseMusicXml(await mx.readScoreText(new TextEncoder().encode(xml)));
+  const tracks = score.parts.flatMap((p) => p.tracks).filter((tr) => tr.noteCount > 0);
+
+  const sel = ed.arrangementSelection(tracks, mx.recommendArrangement(score));
+  assert.equal(tracks.find((tr) => tr.key === sel.vocalKey).partId, 'P1');
+  assert.equal(sel.playKeys.length, 2);
+  const handOf = (pid) => sel.hands[tracks.find((tr) => tr.partId === pid).key];
+  assert.equal(handOf('P2'), 'R');
+  assert.equal(handOf('P3'), 'L');
+
+  const res = mx.scoreToArrangement(score, ed.arrangementRequest({ ...sel, includeLyrics: true }));
+  assert.equal(res.vocal.length, 4);
+  const parts = ed.arrangementDraftParts(res, { right: 2, left: 1 });
+  assert.deepEqual([parts.stats.right, parts.stats.left], [6, 2]);
+  assert.equal(parts.stats.belowFloor, 1);
+  assert.deepEqual(parts.notes.filter((n) => n.h === 'L').map((n) => n.m), [36, 43]);
+  assert.ok(parts.notes.some((n) => n.m < JUDGE_FLOOR));
+
+  const d = { ...songDraft(), lyrics: { text: '', source: 'notes', lines: [] } };
+  ed.applyArrangementImport(d, {
+    notes: parts.notes, vocal: parts.vocal, bpm: res.bpm, beatsPerBar: res.beatsPerBar, offset: res.offset, lyricText: res.lyricText,
+  });
+  assert.equal(d.arrangement, 'accompaniment');
+  assert.equal(d.beatsPerBar, 4);
+  assert.equal(d.lyrics.source, 'notes');
+  assert.ok(d.lyrics.text.trim());
+  assert.deepEqual(assignLyricsFn(d.lyrics.text, lyricTimingNotes(d)).warnings, []);
+  // the sung melody and the accompaniment share one timeline (bar 2 starts together)
+  const bar2 = (60 / d.bpm) * 4;
+  assert.ok(d.vocal.some((n) => Math.abs(n.t - bar2) < 0.002));
+  assert.ok(d.notes.some((n) => n.h === 'R' && Math.abs(n.t - bar2) < 0.002));
+
+  // the song survives normalization (save / preview path)
+  const saved = normalizeSong({ ...d, id: 'x', title: 'x' });
+  assert.equal(saved.arrangement, 'accompaniment');
+  assert.equal(saved.vocal.length, 4);
+  assert.ok(saved.notes.some((n) => n.h === 'L'));
+});

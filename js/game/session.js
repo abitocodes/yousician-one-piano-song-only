@@ -1,9 +1,14 @@
 // Game session: owns the clock, the judge, audio scheduling (guide melody / metronome / simulated
 // input), the optional backing track and practice-mode holds. DOM-free; the play screen drives it by
 // calling tick() every animation frame.
+//
+// Accompaniment songs (song.arrangement 'accompaniment'): the notes are both hands, judged per chord (Judge
+// groupMode; notes below JUDGE_FLOOR are display-only), and song.vocal is the sung melody: never judged, played
+// as the guide melody and in listen mode, and passed to the renderer as an outline guide.
 import { Emitter } from '../core/emitter.js';
 import { pitchClass } from '../core/notes.js';
 import { songDuration } from '../core/song.js';
+import { JUDGE_FLOOR } from '../core/arrange.js';
 import { getAudioContext, audioNow, setMasterVolume } from '../audio/engine.js';
 import { Synth } from '../audio/synth.js';
 import { BackingTrack } from '../audio/backing.js';
@@ -25,6 +30,8 @@ const LATE_TOLERANCE = 0.05;      // audio events at most this late are still pl
 const SUSPEND_PAUSE_MS = 700;     // auto-pause when the audio context stays suspended this long
 const SIM_RETRY_MS = 1200;        // practice + sim: replay the held notes if the detector missed them
 const MAX_OUTPUT_LATENCY = 0.5;   // cap for the device output-delay compensation (s)
+const LISTEN_ACCOMP_VELOCITY = 0.6; // listen mode with a sung melody: the accompaniment steps back
+const VOCAL_VELOCITY = 0.9;       // the sung melody (guide / listen)
 const EMPTY = Object.freeze([]);
 const EPS = 1e-6;
 
@@ -54,7 +61,8 @@ function lowerBound(notes, x) {
 
 // Collapses notes at the same onset (within GROUP_EPS) and the same rounded pitch into one: a single
 // strike can only hit one of them, so the copy would be an unavoidable MISS. The kept note takes the
-// longest duration as a copy (the song's own note objects are never mutated). Input must be sorted.
+// longest duration and a right-hand tag wins over a left-hand one, as a copy (the song's own note objects
+// are never mutated). Input must be sorted.
 function dedupeNotes(notes) {
   const out = [];
   for (const n of notes) {
@@ -71,9 +79,23 @@ function dedupeNotes(notes) {
       continue;
     }
     const d = Number(n.d);
-    if (Number.isFinite(d) && !(Number(out[dup].d) >= d)) out[dup] = { ...out[dup], d };
+    const longer = Number.isFinite(d) && !(Number(out[dup].d) >= d);
+    const right = n.h === 'R' && out[dup].h === 'L';
+    if (longer || right) {
+      const kept = { ...out[dup] };
+      if (longer) kept.d = d;
+      if (right) kept.h = 'R';
+      out[dup] = kept;
+    }
   }
   return out.length === notes.length ? notes : out;
+}
+
+// Valid notes sorted by time then pitch (the same array when it already is).
+function sortedNotes(list) {
+  const raw = Array.isArray(list) ? list.filter((n) => n && Number.isFinite(n.t) && Number.isFinite(n.m)) : [];
+  const valid = Array.isArray(list) && raw.length === list.length ? list : raw;
+  return isSortedByTime(valid) ? valid : valid.slice().sort((a, b) => (a.t - b.t) || (a.m - b.m));
 }
 
 export class GameSession extends Emitter {
@@ -90,7 +112,10 @@ export class GameSession extends Emitter {
     // One array feeds the judge, the snapshot (renderer), the scheduler and the sim bookkeeping, so
     // indices stay aligned everywhere.
     this.notes = dedupeNotes(isSortedByTime(raw) ? raw : raw.sort((a, b) => (a.t - b.t) || (a.m - b.m)));
-    this.duration = songDuration({ notes: this.notes, lyrics: song.lyrics });
+    // The sung melody (accompaniment songs): guide melody / listen audio and the renderer's outline guide only.
+    this.vocal = sortedNotes(song.vocal);
+    this.arrangement = song.arrangement === 'accompaniment' ? 'accompaniment' : 'melody';
+    this.duration = songDuration({ notes: this.notes, vocal: this.vocal, lyrics: song.lyrics });
     this.firstNoteT = this.notes.length ? this.notes[0].t : null;
     let span = EXPECT_MIN_LEN;
     for (const n of this.notes) span = Math.max(span, Number(n.d) || 0);
@@ -118,6 +143,8 @@ export class GameSession extends Emitter {
     this._state = 'ready';
     this._pressed = new Set();
     this._expected = new Set();
+    this._expectedLeft = new Set();   // expected keys whose notes are all left-hand (renderer colour)
+    this._expectedRight = new Set();
     this._touchVoices = new Map();
     this._voices = [];            // scheduled chart-audio voices { h, songT, end }
     this._unsubs = [];
@@ -128,6 +155,7 @@ export class GameSession extends Emitter {
 
     this._schedFrom = 0;
     this._schedNote = 0;
+    this._schedVocal = 0;
     this._lastSync = 0;
     this._acceptFrom = -Infinity;
     this._releaseStrikeRaw = -Infinity;
@@ -342,7 +370,7 @@ export class GameSession extends Emitter {
     if (tc < this._acceptFrom - 0.05) return;                         // from before (re)start
     if (Math.abs(raw - this._releaseStrikeRaw) <= SAME_STRIKE) return; // rest of the strike that released a hold
     const echo = this._echo;
-    if (echo && raw >= echo.from && raw <= echo.until && echo.pcs.has(pitchClass(midi))) return;
+    if (echo && (!echo.hold || st === 'holding') && raw >= echo.from && raw <= echo.until && echo.pcs.has(pitchClass(midi))) return;
     if (st === 'holding') {
       this._hitHeld(midi, raw, tc);
     } else {
@@ -445,9 +473,12 @@ export class GameSession extends Emitter {
       speed: this._speed,
       countdown,
       notes: this.notes,
+      vocal: this.vocal,
+      arrangement: this.arrangement,
       states: listen ? this._autoStates : this.judge.states,
       judgedAt: listen ? this._autoJudgedAt : this.judge.judgedAt,
       expectedKeys: this._expected,
+      expectedLeft: this._expectedLeft,
       pressedKeys: this._pressed,
       detected,
       stats: this.judge.stats,
@@ -458,24 +489,42 @@ export class GameSession extends Emitter {
 
   _computeExpected(songTime) {
     const set = this._expected;
+    const left = this._expectedLeft;
+    const right = this._expectedRight;
     set.clear();
+    left.clear();
+    right.clear();
     const notes = this.notes;
     if (!notes.length) return;
+    const add = (n) => {
+      set.add(n.m);
+      if (n.h === 'L') left.add(n.m);
+      else right.add(n.m);
+    };
     if (this.mode === 'listen') {
       for (let i = lowerBound(notes, songTime - this._maxSpan); i < notes.length; i++) {
         const n = notes[i];
         if (n.t > songTime + 0.02) break;
-        if (songTime >= n.t - 0.02 && songTime < n.t + n.d) set.add(n.m);
+        if (songTime >= n.t - 0.02 && songTime < n.t + n.d) add(n);
       }
     } else {
       const states = this.judge.states;
       for (let i = lowerBound(notes, songTime - this._maxSpan); i < notes.length; i++) {
         const n = notes[i];
         if (n.t - EXPECT_BEFORE > songTime) break;
-        if (states[i] === 'pending' && songTime <= n.t + Math.max(n.d, EXPECT_MIN_LEN)) set.add(n.m);
+        // Display-only (below the judge floor) notes stay lit while they sound, like listen mode.
+        const st = states[i];
+        if ((st === 'pending' || st === 'auto') && songTime <= n.t + Math.max(n.d, EXPECT_MIN_LEN)) add(n);
       }
     }
-    if (this._state === 'holding' || this.clock.held) for (const m of this._holdMidis) set.add(m);
+    if (this._state === 'holding' || this.clock.held) {
+      for (const m of this._holdMidis) {
+        if (!set.has(m)) right.add(m);
+        set.add(m);
+      }
+    }
+    // A key both hands expect is shown in the right-hand colour.
+    for (const m of right) left.delete(m);
   }
 
   _advanceAuto(songTime) {
@@ -512,9 +561,12 @@ export class GameSession extends Emitter {
     this._cancelAfter(t + GROUP_EPS);
     if (this.backing) this.backing.pause();
     this._holdMidis = this.judge.pendingGroup().map((i) => this.notes[i].m);
-    this._hint = this._opt('guideMelody', false)
+    // With a sung melody the guide is that melody (scheduled like play mode), not a hint of the held notes.
+    this._hint = this._opt('guideMelody', false) && !this.vocal.length
       ? { atPerf: perfNow() + (this._micActive() ? HINT_DELAY_MIC * 1000 : 0), done: false }
       : null;
+    const vocalEcho = this._vocalEcho(t, this._holdCtx);
+    if (vocalEcho) this._echo = vocalEcho;
     this._setState('holding');
     this._updateHint();
     if (this._simActive()) {
@@ -555,10 +607,36 @@ export class GameSession extends Emitter {
     }
   }
 
+  // Practice with the sung melody as the guide (mic): the melody keeps sounding through the speaker, and its notes
+  // at the hold are usually chord tones, so the mic would release the hold by itself. Like the hint's echo guard:
+  // while the song waits, detections of the pitch classes of the melody notes that start shortly before or at the
+  // held group, or still sound there, are ignored until those notes have ended (+ the input latency).
+  // `cross`: context time at which the group reached the line. null when there is nothing to guard.
+  _vocalEcho(holdT, cross) {
+    if (this.mode !== 'practice' || !this.vocal.length || !this._micActive() || !this._guideActive()) return null;
+    if (!Number.isFinite(cross)) return null;
+    const speed = this._speed;
+    const recent = holdT - HINT_ECHO_GUARD * speed;
+    const pcs = new Set();
+    let until = cross + HINT_ECHO_GUARD;
+    const voc = this.vocal;
+    const hi = lowerBound(voc, holdT + GROUP_EPS + EPS * 2);
+    for (let k = 0; k < hi; k++) {
+      const n = voc[k];
+      const end = n.t + (Number(n.d) || 0);
+      if (n.t < recent - EPS && end <= holdT + EPS) continue;
+      pcs.add(pitchClass(n.m));
+      until = Math.max(until, cross + (end - holdT) / speed);
+    }
+    if (!pcs.size) return null;
+    return { from: cross - HINT_ECHO_GUARD, until: until + Math.max(0, this._latency()), pcs, hold: true };
+  }
+
   // Resumes the song as if it had been running since `resumeAt` (≤ now), so it catches up with a player
   // whose strike was only detected later.
   _releaseHold(now, resumeAt = now) {
     this.clock.release(Math.min(now, resumeAt));
+    if (this._echo && this._echo.hold) this._echo = null;
     this._hint = null;
     this._holdMidis = EMPTY;
     if (this._state === 'holding') {
@@ -593,6 +671,7 @@ export class GameSession extends Emitter {
   _resetScheduler(fromSong) {
     this._schedFrom = fromSong;
     this._schedNote = lowerBound(this.notes, fromSong - EPS);
+    this._schedVocal = lowerBound(this.vocal, fromSong - EPS);
   }
 
   _scheduleAudio(songTime) {
@@ -611,8 +690,12 @@ export class GameSession extends Emitter {
     const notes = this.notes;
     const sim = this._simActive();
     const guide = this._guideActive();
+    // The sung melody is the guide when there is one; listen mode plays it over the accompaniment.
+    const vocal = guide && this.vocal.length > 0;
+    const accompaniment = sim || (guide && (!vocal || this.mode === 'listen'));
+    const quiet = vocal && this.mode === 'listen';
     let i = this._schedNote;
-    if (sim || guide) {
+    if (accompaniment) {
       const dest = sim ? this._simDest() : undefined;
       // Simulated input reaches the detector directly (no output delay), so it stays on the beat.
       const lead = sim ? 0 : outLat;
@@ -621,7 +704,7 @@ export class GameSession extends Emitter {
         if (n.t < from - EPS) continue;
         const when = this._startAt(n.t, lead, ctxNow);
         if (when === null) continue;
-        const vel = Number.isFinite(n.v) ? clamp(n.v, 0.4, 1) : 0.8;
+        const vel = quiet ? LISTEN_ACCOMP_VELOCITY : Number.isFinite(n.v) ? clamp(n.v, 0.4, 1) : 0.8;
         const h = this.synth.playNote(n.m, when, Math.max(0.05, n.d / this._speed), { velocity: vel, destination: dest });
         this._voices.push({ h, songT: n.t, end: h.end });
         if (sim) this._simPlayed[i] = 1;
@@ -630,6 +713,23 @@ export class GameSession extends Emitter {
       while (i < notes.length && notes[i].t < horizon) i++;
     }
     this._schedNote = i;
+
+    const voc = this.vocal;
+    let k = this._schedVocal;
+    if (vocal) {
+      // Audible only: never fed into the simulated input (it would be judged).
+      for (; k < voc.length && voc[k].t < horizon; k++) {
+        const n = voc[k];
+        if (n.t < from - EPS) continue;
+        const when = this._startAt(n.t, outLat, ctxNow);
+        if (when === null) continue;
+        const h = this.synth.playNote(n.m, when, Math.max(0.05, n.d / this._speed), { velocity: VOCAL_VELOCITY });
+        this._voices.push({ h, songT: n.t, end: h.end });
+      }
+    } else {
+      while (k < voc.length && voc[k].t < horizon) k++;
+    }
+    this._schedVocal = k;
 
     if (this.mode !== 'calibrate') {
       if (this._opt('metronome', false)) this._scheduleBeats(from, horizon, ctxNow, outLat);
@@ -795,9 +895,12 @@ export class GameSession extends Emitter {
     return this.mode !== 'calibrate' && this._opt('inputMode', 'mic') === 'sim' && !!this.input && !!this.input.simInput;
   }
 
+  // Whether chart audio plays for listening: always in listen mode; with the guide melody setting in play mode,
+  // and in practice mode too when there is a sung melody (otherwise practice plays a hint at each hold).
   _guideActive() {
     if (this.mode === 'listen') return true;
-    return this.mode === 'play' && !!this._opt('guideMelody', false);
+    if (!this._opt('guideMelody', false)) return false;
+    return this.mode === 'play' || (this.mode === 'practice' && this.vocal.length > 0);
   }
 
   // Simulated input: audible through the synth bus and fed into the detector's input node.
@@ -832,6 +935,8 @@ export class GameSession extends Emitter {
 
   _computeStartTime() {
     let first = this.firstNoteT;
+    // A sung melody may start before the accompaniment (a pickup): its first note needs the lead-in too.
+    if (this.vocal.length && (first === null || this.vocal[0].t < first)) first = this.vocal[0].t;
     if (first === null) {
       const lines = this.song.lyrics && Array.isArray(this.song.lyrics.lines) ? this.song.lyrics.lines : [];
       first = Infinity;
@@ -860,6 +965,10 @@ export class GameSession extends Emitter {
     if (this.mode === 'calibrate') {
       opts.anyPitch = true;
       opts.windows = CALIBRATE_WINDOWS;
+    } else if (this.arrangement === 'accompaniment') {
+      // Both hands: a chord counts once, hit by any of its notes; very low notes are display-only.
+      opts.groupMode = true;
+      opts.floor = JUDGE_FLOOR;
     }
     this.judge = new Judge(this.notes, opts);
     this._judgeUnsub = this.judge.on('judge', (r) => this.emit('judge', r));

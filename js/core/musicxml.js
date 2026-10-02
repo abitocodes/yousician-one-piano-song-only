@@ -1,10 +1,12 @@
 // MusicXML import (.musicxml / .xml / compressed .mxl, e.g. produced by OMR tools from PDF sheet music):
 // a small XML parser, a lenient score model (parts → staves → voices), repeat unfolding, a tempo map,
-// and conversion of one melody track into app notes (seconds) plus lyric text in the app's lyric syntax.
-// Pure module: no DOM access, importable in Node 22.
+// and conversion of one melody track into app notes (seconds) plus lyric text in the app's lyric syntax —
+// or of several tracks on one shared timeline into a two-hand accompaniment plus the sung melody
+// (scoreToArrangement / recommendArrangement). Pure module: no DOM access, importable in Node 22.
 
 import { unzip } from './unzip.js';
 import { tokenizeLine, groupNoteEvents } from './lyrics.js';
+import { tagHand, splitHands, mergeTracks } from './arrange.js';
 
 const ERR_XML = '악보 파일(XML)을 읽을 수 없어요.';
 const ERR_READ = '악보 파일을 읽을 수 없어요.';
@@ -31,6 +33,12 @@ const WARN_NO_NOTES = '선택한 성부에 음표가 없어요.';
 const WARN_ALIGN = '일부 가사 줄의 정렬을 확인해 주세요.';
 const warnVerse = (n) => `${n}절 가사가 없는 부분은 다른 절 가사를 사용했어요.`;
 const warnDropped = (n) => `음역을 벗어난 노트 ${n}개를 뺐어요.`;
+const ERR_NO_PLAY = '연주할 성부를 하나 이상 골라 주세요.';
+const WARN_NO_PLAY_NOTES = '연주할 성부에 음표가 없어요.';
+const WARN_NO_VOCAL_NOTES = '노래 멜로디로 고른 성부에 음표가 없어요.';
+const WARN_NO_VOCAL = '노래 멜로디 성부를 고르지 않아 가사는 반주 노트에 맞춰 배치돼요.';
+const warnMeasuresAligned = (list) => `파트마다 마디 길이가 달라 맞춰 정렬한 마디가 있어요(${list.slice(0, 6).join(', ')}`
+  + `번째 마디${list.length > 6 ? ' 등' : ''}). 그 부분의 리듬을 확인해 주세요.`;
 
 const EPS = 1e-6;
 const MAX_PLAYED = 2000;
@@ -377,6 +385,13 @@ function displayPartName(raw, index) {
     if (m) return m[1] ? `${ko} ${m[1]}` : ko;
   }
   return name;
+}
+
+// Parts with the same display name (OMR often names every part 'Piano') get their position: '피아노 (파트 2)'.
+function disambiguatePartNames(parts) {
+  const count = new Map();
+  for (const p of parts) count.set(p.name, (count.get(p.name) || 0) + 1);
+  for (const p of parts) if (count.get(p.name) > 1) p.name = `${p.name} (파트 ${p.index + 1})`;
 }
 
 const expectedQ = (ts) => (ts.num * 4) / ts.den;
@@ -1014,6 +1029,7 @@ export function parseMusicXml(xmlText) {
   const partEls = root.children.filter((c) => c.name === 'part');
   if (!partEls.length) throw new Error(ERR_NO_PARTS);
   const parts = partEls.map((el, i) => parsePart(el, i, names));
+  disambiguatePartNames(parts);
   const measureCount = Math.max(...parts.map((p) => p.measures.length));
 
   const flow = [];
@@ -1176,7 +1192,19 @@ const hasText = (lyr) => Boolean(lyr) && lyr.kind === 'text';
 const matches = (note, def) => (def.staff === null || note.home === def.staff)
   && (def.voice === null || note.voice === def.voice);
 
-function buildTempoMap(internal, part, order, starts, quarterBpm) {
+// Start (quarters) of every played measure instance; a pickup measure starts so that it ends on a full bar.
+function measureStarts(order, lens, pickupShift) {
+  const starts = [];
+  let q = order.length && order[0].idx === 0 ? pickupShift : 0;
+  for (const o of order) {
+    starts.push(q);
+    q += lens[o.idx];
+  }
+  return starts;
+}
+
+// lens: measure lengths (quarters) of the timeline the starts were computed with.
+function buildTempoMap(internal, lens, order, starts, quarterBpm) {
   if (quarterBpm) {
     const spq = 60 / quarterBpm;
     return { sec: (q) => q * spq, initial: quarterBpm, found: true, changes: false };
@@ -1184,7 +1212,7 @@ function buildTempoMap(internal, part, order, starts, quarterBpm) {
   const events = [];
   for (let k = 0; k < order.length; k++) {
     const idx = order[k].idx;
-    for (const t of internal.tempos[idx]) events.push({ q: starts[k] + Math.min(t.pos, part.lens[idx]), bpm: t.bpm });
+    for (const t of internal.tempos[idx]) events.push({ q: starts[k] + Math.min(t.pos, lens[idx]), bpm: t.bpm });
   }
   events.sort((a, b) => a.q - b.q);
   const found = events.length > 0;
@@ -1215,18 +1243,18 @@ function buildTempoMap(internal, part, order, starts, quarterBpm) {
 
 /**
  * Core extraction of one track along the play order.
- * opts: { unfold, verse: number|null, melodyOnly }
+ * opts: { unfold, verse: number|null, melodyOnly, flow?, layout? } — `flow` is a precomputed play order
+ * ({ order, warnings }) and `layout` a shared timeline (see sharedLayout) used instead of the part's own
+ * measure lengths, so several tracks line up.
  */
 function extractTrack(internal, part, def, opts) {
   const n = part.measures.length;
-  const { order, warnings } = opts.unfold ? unfoldOrder(internal) : straightOrder(n);
-
-  const starts = [];
-  let q = order.length && order[0].idx === 0 ? part.pickupShift : 0;
-  for (const o of order) {
-    starts.push(q);
-    q += part.lens[o.idx];
-  }
+  const { order, warnings } = opts.flow || (opts.unfold ? unfoldOrder(internal) : straightOrder(n));
+  const layout = opts.layout || null;
+  const place = layout ? layout.place.get(part) : null;
+  const starts = layout
+    ? measureStarts(order, layout.lens, layout.pickupShift)
+    : measureStarts(order, part.lens, part.pickupShift);
 
   // Lyric numbers present per measure for this track → chosen number per played instance.
   const numsByMeasure = part.measures.map((m) => {
@@ -1249,14 +1277,17 @@ function extractTrack(internal, part, def, opts) {
   let items = [];
   for (let k = 0; k < order.length; k++) {
     const idx = order[k].idx;
-    const base = starts[k];
+    const shift = place ? place.shift[idx] : 0;
+    const scale = place ? place.scale[idx] : 1;
+    const base = starts[k] + shift;
     const num = chosen[k];
     for (const note of part.measures[idx].notes) {
       if (!matches(note, def)) continue;
       let lyr = null;
       if (num !== null) for (const l of note.lyrics) if (l.number === num) lyr = l;
+      const q = base + note.pos * scale;
       items.push({
-        q: base + note.pos, e: base + note.pos + note.dur, m: note.midi, voice: note.voice, staff: note.home,
+        q, e: q + note.dur * scale, m: note.midi, voice: note.voice, staff: note.home,
         tieStart: note.tieStart, tieStop: note.tieStop, lyr, inst: k, sung: note.lyrics.some((l) => l.kind === 'text'),
       });
     }
@@ -1336,6 +1367,15 @@ function trackInfo(internal, part, def) {
     if (it.sung) lyricCount++;
   }
   const noteCount = ex.items.length;
+  // Every note including chord tones (what the track plays as an accompaniment part).
+  const all = extractTrack(internal, part, def, { unfold: false, verse: null, melodyOnly: false });
+  let allMin = Infinity;
+  let allMax = -Infinity;
+  for (const it of all.items) {
+    if (it.m < allMin) allMin = it.m;
+    if (it.m > allMax) allMax = it.m;
+  }
+  const allNotes = all.items.length;
   return {
     key: def.key,
     partId: part.id,
@@ -1347,6 +1387,9 @@ function trackInfo(internal, part, def) {
     min: noteCount ? min : null,
     max: noteCount ? max : null,
     avgPitch: noteCount ? r2(sum / noteCount) : null,
+    allNotes,
+    allMin: allNotes ? allMin : null,
+    allMax: allNotes ? allMax : null,
   };
 }
 
@@ -1574,6 +1617,77 @@ function beatGrid(ts, quarterBpm) {
   return { unit, perBar, bpm };
 }
 
+const parseVerse = (verse) => {
+  const v = verse === 'auto' || verse == null || verse === '' ? null : parseInt(verse, 10);
+  return Number.isInteger(v) && v >= 1 ? v : null;
+};
+
+const bpmOverride = (bpm) => (Number(bpm) > 0 && Number.isFinite(Number(bpm)) ? clamp(Number(bpm), 30, 300) : null);
+
+// Tempo map + beat grid of a timeline: the score's tempo marks, or one constant `override` BPM counted in grid beats.
+function timing(internal, lens, order, starts, ts0, override, warnings) {
+  const natural = buildTempoMap(internal, lens, order, starts, null);
+  const grid = beatGrid(ts0, natural.initial);
+  let map = natural;
+  if (override) {
+    map = buildTempoMap(internal, lens, order, starts, (override * 4) / grid.unit);
+    grid.bpm = override;
+  } else {
+    if (!map.found) warnings.push(WARN_NO_TEMPO);
+    if (map.changes) warnings.push(WARN_TEMPO_CHANGES);
+  }
+  return { map, grid };
+}
+
+// Extracted items (quarters) → app notes (seconds, sorted) paired with their items; out-of-range pitches dropped.
+function itemsToNotes(items, map) {
+  const pairs = [];
+  let dropped = 0;
+  for (const it of items) {
+    if (it.m < 0 || it.m > 127) {
+      dropped++;
+      continue;
+    }
+    const t = map.sec(it.q);
+    const end = map.sec(Math.max(it.e, it.q));
+    pairs.push({ note: { t: r3(t), d: r3(Math.max(MIN_NOTE_D, end - t)), m: it.m }, it });
+  }
+  pairs.sort((a, b) => a.note.t - b.note.t || a.note.m - b.note.m);
+  return { pairs, notes: pairs.map((p) => p.note), dropped };
+}
+
+// Lyric text of one extracted track: exactly one token per note event of conv.notes (groupNoteEvents).
+function trackLyricText(score, part, key, ex, conv, verseNum, warnings) {
+  const internal = score._internal;
+  if (ex.verseMissing) warnings.push(warnVerse(verseNum));
+  const brk = ex.order.map((o, k) => {
+    if (k === 0) return 0;
+    if (o.idx <= ex.order[k - 1].idx) return BREAK_JUMP;
+    return internal.flow[o.idx].newSystem ? BREAK_SYSTEM : 0;
+  });
+  const beatQ = ex.order.map((o) => Math.max(1, 4 / part.measures[o.idx].ts.den));
+  const evs = groupNoteEvents(conv.notes).map((ev) => {
+    const its = ev.idx.map((i) => conv.pairs[i].it);
+    let top = its[0];
+    let q = Infinity;
+    let e = -Infinity;
+    for (const it of its) {
+      if (it.m > top.m) top = it;
+      if (it.q < q) q = it.q;
+      if (it.e > e) e = it.e;
+    }
+    return { q, e, inst: top.inst, lyr: eventLyric(its) };
+  });
+  const built = buildLyricText(evs, brk, beatQ);
+  if (!built.syllables) {
+    const withLyrics = allTracks(score).filter((t) => t.key !== key && t.lyricCount > 0)
+      .sort((a, b) => b.lyricCount - a.lyricCount);
+    warnings.push(withLyrics.length ? warnLyricsElsewhere(withLyrics[0].label) : WARN_NO_LYRICS);
+  }
+  if (built.misaligned) warnings.push(WARN_ALIGN);
+  return built;
+}
+
 /**
  * Converts one track of a parsed score into app data:
  * { notes, lyricText, bpm, beatsPerBar, offset: 0, warnings, stats: { notes, syllables } }.
@@ -1593,74 +1707,27 @@ export function scoreToSong(score, {
   const { part, def } = found;
   const warnings = [];
 
-  const verseNum = verse === 'auto' || verse == null || verse === '' ? null : parseInt(verse, 10);
+  const verseNum = parseVerse(verse);
   const ts0 = part.measures.length ? part.measures[0].ts : score.timeSignature || { num: 4, den: 4 };
-  const override = Number(bpm) > 0 && Number.isFinite(Number(bpm)) ? clamp(Number(bpm), 30, 300) : null;
-
   const ex = extractTrack(internal, part, def, {
     unfold: unfoldRepeats !== false,
-    verse: Number.isInteger(verseNum) && verseNum >= 1 ? verseNum : null,
+    verse: verseNum,
     melodyOnly: melodyOnly !== false,
   });
   warnings.push(...ex.warnings);
-  const natural = buildTempoMap(internal, part, ex.order, ex.starts, null);
-  const grid = beatGrid(ts0, natural.initial);
-  let map = natural;
-  if (override) {
-    map = buildTempoMap(internal, part, ex.order, ex.starts, (override * 4) / grid.unit);
-    grid.bpm = override;
-  } else {
-    if (!map.found) warnings.push(WARN_NO_TEMPO);
-    if (map.changes) warnings.push(WARN_TEMPO_CHANGES);
-  }
+  const { map, grid } = timing(internal, part.lens, ex.order, ex.starts, ts0, bpmOverride(bpm), warnings);
 
-  const pairs = [];
-  let dropped = 0;
-  for (const it of ex.items) {
-    if (it.m < 0 || it.m > 127) {
-      dropped++;
-      continue;
-    }
-    const t = map.sec(it.q);
-    const end = map.sec(Math.max(it.e, it.q));
-    pairs.push({ note: { t: r3(t), d: r3(Math.max(MIN_NOTE_D, end - t)), m: it.m }, it });
-  }
-  pairs.sort((a, b) => a.note.t - b.note.t || a.note.m - b.note.m);
-  if (dropped) warnings.push(warnDropped(dropped));
-  const notes = pairs.map((p) => p.note);
+  const conv = itemsToNotes(ex.items, map);
+  if (conv.dropped) warnings.push(warnDropped(conv.dropped));
+  const { notes } = conv;
   if (!notes.length) warnings.push(WARN_NO_NOTES);
 
   let lyricText = '';
   let syllables = 0;
   if (includeLyrics !== false && notes.length) {
-    if (ex.verseMissing) warnings.push(warnVerse(verseNum));
-    const brk = ex.order.map((o, k) => {
-      if (k === 0) return 0;
-      if (o.idx <= ex.order[k - 1].idx) return BREAK_JUMP;
-      return internal.flow[o.idx].newSystem ? BREAK_SYSTEM : 0;
-    });
-    const beatQ = ex.order.map((o) => Math.max(1, 4 / part.measures[o.idx].ts.den));
-    const evs = groupNoteEvents(notes).map((ev) => {
-      const its = ev.idx.map((i) => pairs[i].it);
-      let top = its[0];
-      let q = Infinity;
-      let e = -Infinity;
-      for (const it of its) {
-        if (it.m > top.m) top = it;
-        if (it.q < q) q = it.q;
-        if (it.e > e) e = it.e;
-      }
-      return { q, e, inst: top.inst, lyr: eventLyric(its) };
-    });
-    const built = buildLyricText(evs, brk, beatQ);
+    const built = trackLyricText(score, part, key, ex, conv, verseNum, warnings);
     lyricText = built.text;
     syllables = built.syllables;
-    if (!syllables) {
-      const withLyrics = allTracks(score).filter((t) => t.key !== key && t.lyricCount > 0)
-        .sort((a, b) => b.lyricCount - a.lyricCount);
-      warnings.push(withLyrics.length ? warnLyricsElsewhere(withLyrics[0].label) : WARN_NO_LYRICS);
-    }
-    if (built.misaligned) warnings.push(WARN_ALIGN);
   }
 
   return {
@@ -1672,4 +1739,297 @@ export function scoreToSong(score, {
     warnings,
     stats: { notes: notes.length, syllables },
   };
+}
+
+// ---------------------------------------------------------------- two-hand accompaniment
+
+/**
+ * One timeline shared by several parts: a single length per measure that every part follows, so parts that
+ * disagree (typical OMR output: a missed or misread duration in one part) cannot drift apart. The parts with
+ * notes in a measure vote on its length (most votes; a tie → the longer one). In the first (pickup) and last
+ * measure the short parts are usually the incomplete ones (leading / trailing rests not recognised), so there the
+ * longest part wins, up to the time signature's length (unless the vote itself is longer). A part whose content
+ * overruns the measure is squeezed into it; a part that is short in the first measure is aligned to its end.
+ * → { lens, pickupShift, place: Map(part → { shift[], scale[] } per measure, quarters), fixed: measure numbers }
+ */
+function sharedLayout(parts, n) {
+  const lens = new Array(n).fill(0);
+  const place = new Map();
+  for (const p of parts) place.set(p, { shift: new Array(n).fill(0), scale: new Array(n).fill(1) });
+  const fixed = [];
+  for (let i = 0; i < n; i++) {
+    let voters = parts.filter((p) => p.measures[i].notes.length > 0);
+    if (!voters.length) voters = parts.filter((p) => p.measures[i].actual > EPS);
+    if (!voters.length) voters = parts;
+    const tally = [];
+    let longest = 0;
+    let nominal = 0;
+    for (const p of voters) {
+      const own = p.lens[i];
+      const hit = tally.find((x) => Math.abs(x.len - own) <= EPS);
+      if (hit) hit.count++;
+      else tally.push({ len: own, count: 1 });
+      longest = Math.max(longest, own);
+      nominal = Math.max(nominal, expectedQ(p.measures[i].ts));
+    }
+    let best = tally[0];
+    for (const x of tally) if (x.count > best.count || (x.count === best.count && x.len > best.len + EPS)) best = x;
+    const len = i === 0 || i === n - 1 ? Math.max(best.len, Math.min(longest, nominal)) : best.len;
+    lens[i] = len;
+    // Reported: content that was moved or squeezed, or a complete measure that now ends with a gap
+    // (a part that merely ends early, e.g. a closing partial measure, is harmless).
+    let differs = false;
+    for (const p of parts) {
+      const m = p.measures[i];
+      if (!m.notes.length) continue;
+      const own = p.lens[i];
+      const pl = place.get(p);
+      if (m.actual > len + EPS) {
+        // Only content that really overruns is squeezed: a part whose own (time-signature) length is longer but
+        // whose notes fit (a missed time signature change) stays as written.
+        pl.scale[i] = len / m.actual;
+        differs = true;
+      } else if (own < len - EPS) {
+        if (i === 0) pl.shift[i] = len - own;
+        if (i === 0 || m.actual >= expectedQ(m.ts) - EPS) differs = true;
+      }
+    }
+    if (differs) fixed.push(i + 1);
+  }
+  const exp0 = n ? expectedQ(parts[0].measures[0].ts) : 0;
+  const pickupShift = n && lens[0] < exp0 - EPS ? exp0 - lens[0] : 0;
+  return { lens, pickupShift, place, fixed };
+}
+
+const laneOf = (partId, staff) => `${partId}|${staff === null ? '*' : staff}`;
+
+// Hand-tagged note lists: hands[key] when given ('R' / 'L'); otherwise by register — the lane (part + staff)
+// with the highest average pitch plays with the right hand, other lanes with the left; a single lane is split
+// at middle C (splitHands).
+function handLists(play, lists, hands) {
+  const given = hands !== null && typeof hands === 'object' ? hands : {};
+  const lanes = new Map();
+  play.forEach((tr, k) => {
+    const lane = laneOf(tr.part.id, tr.def.staff);
+    let a = lanes.get(lane);
+    if (!a) lanes.set(lane, (a = { sum: 0, count: 0 }));
+    for (const n of lists[k]) {
+      a.sum += n.m;
+      a.count++;
+    }
+  });
+  let top = null;
+  let topAvg = -Infinity;
+  let filled = 0;
+  for (const [lane, a] of lanes) {
+    if (!a.count) continue;
+    filled++;
+    const avg = a.sum / a.count;
+    if (avg > topAvg + EPS) {
+      top = lane;
+      topAvg = avg;
+    }
+  }
+  return play.map((tr, k) => {
+    const own = Object.prototype.hasOwnProperty.call(given, tr.key) ? given[tr.key] : null;
+    if (own === 'R' || own === 'L') return tagHand(lists[k], own);
+    if (filled < 2) return splitHands(lists[k]);
+    return tagHand(lists[k], laneOf(tr.part.id, tr.def.staff) === top ? 'R' : 'L');
+  });
+}
+
+/**
+ * Converts a score into a two-hand accompaniment plus the sung melody, all on ONE timeline (same play order,
+ * same tempo map, shared measure lengths — see sharedLayout):
+ * { notes (play tracks merged, hand-tagged, chords kept, sorted), vocal (melody of the vocal track, ties merged),
+ *   lyricText (from the vocal track, one token per vocal note event; '' when none), bpm, beatsPerBar, offset: 0,
+ *   warnings, stats: { right, left, vocal, syllables } }.
+ * hands: { [playKey]: 'R' | 'L' }; missing keys go by register (see handLists). `bpm` overrides like scoreToSong.
+ */
+export function scoreToArrangement(score, {
+  vocalKey = null, playKeys = [], hands = {}, verse = 'auto', includeLyrics = true, unfoldRepeats = true, bpm,
+} = {}) {
+  if (!score || !score._internal || !Array.isArray(score._internal.parts)) throw new Error(ERR_SCORE);
+  const internal = score._internal;
+  const keys = [];
+  for (const k of [].concat(playKeys == null ? [] : playKeys)) {
+    if (typeof k === 'string' && k && !keys.includes(k)) keys.push(k);
+  }
+  if (!keys.length) throw new Error(ERR_NO_PLAY);
+  const play = keys.map((key) => {
+    const found = findTrack(score, key);
+    if (!found) throw new Error(ERR_TRACK);
+    return { key, part: found.part, def: found.def };
+  });
+  let vocal = null;
+  if (vocalKey) {
+    const found = findTrack(score, vocalKey);
+    if (!found) throw new Error(ERR_TRACK);
+    vocal = { key: vocalKey, part: found.part, def: found.def };
+  }
+  const warnings = [];
+
+  const involved = internal.parts.filter((p) => (vocal && vocal.part === p) || play.some((tr) => tr.part === p));
+  const n = involved[0].measures.length;
+  const layout = sharedLayout(involved, n);
+  const flow = unfoldRepeats !== false ? unfoldOrder(internal) : straightOrder(n);
+  warnings.push(...flow.warnings);
+  const starts = measureStarts(flow.order, layout.lens, layout.pickupShift);
+  const lead = (vocal || play[0]).part;
+  const ts0 = lead.measures.length ? lead.measures[0].ts : score.timeSignature || { num: 4, den: 4 };
+  const { map, grid } = timing(internal, layout.lens, flow.order, starts, ts0, bpmOverride(bpm), warnings);
+  if (layout.fixed.length) warnings.push(warnMeasuresAligned(layout.fixed));
+
+  let dropped = 0;
+  const lists = play.map(({ part, def }) => {
+    const ex = extractTrack(internal, part, def, { flow, layout, verse: null, melodyOnly: false });
+    const conv = itemsToNotes(ex.items, map);
+    dropped += conv.dropped;
+    return conv.notes;
+  });
+  const notes = mergeTracks(...handLists(play, lists, hands));
+  if (!notes.length) warnings.push(WARN_NO_PLAY_NOTES);
+
+  let vocalNotes = [];
+  let lyricText = '';
+  let syllables = 0;
+  if (vocal) {
+    const verseNum = parseVerse(verse);
+    const ex = extractTrack(internal, vocal.part, vocal.def, { flow, layout, verse: verseNum, melodyOnly: true });
+    const conv = itemsToNotes(ex.items, map);
+    dropped += conv.dropped;
+    vocalNotes = conv.notes;
+    if (!vocalNotes.length) {
+      warnings.push(WARN_NO_VOCAL_NOTES);
+    } else if (includeLyrics !== false) {
+      const built = trackLyricText(score, vocal.part, vocal.key, ex, conv, verseNum, warnings);
+      lyricText = built.text;
+      syllables = built.syllables;
+    }
+  } else {
+    warnings.push(WARN_NO_VOCAL);
+  }
+  if (dropped) warnings.push(warnDropped(dropped));
+
+  let right = 0;
+  for (const nt of notes) if (nt.h === 'R') right++;
+  return {
+    notes,
+    vocal: vocalNotes,
+    lyricText,
+    bpm: r2(clamp(grid.bpm, 30, 300)),
+    beatsPerBar: clamp(Math.round(grid.perBar), 1, 16),
+    offset: 0,
+    warnings,
+    stats: { right, left: notes.length - right, vocal: vocalNotes.length, syllables },
+  };
+}
+
+const VOCAL_NAME_RE = /보컬|노래|가창|멜로디|voice|vocal|vox|sing|soprano|melody/i;
+const MONO_MAX_CHORDS = 0.15; // a sung line has (almost) no chords
+const VOCAL_MIN_AVG = 55; // G3: lower lines are bass lines, not sung melodies
+const SOLO_PART_SHARE = 0.9; // a line holding this share of its part's notes is that part's own line
+
+// Share of onsets with several pitches (chords) in a track, in score order.
+function chordShare(internal, part, def) {
+  const items = extractTrack(internal, part, def, { unfold: false, verse: null, melodyOnly: false }).items;
+  let groups = 0;
+  let chords = 0;
+  for (let a = 0; a < items.length;) {
+    let b = a + 1;
+    let multi = false;
+    while (b < items.length && items[b].q - items[a].q < EPS) {
+      if (items[b].m !== items[a].m) multi = true;
+      b++;
+    }
+    groups++;
+    if (multi) chords++;
+    a = b;
+  }
+  return groups ? chords / groups : 0;
+}
+
+// Sung-melody guess when no track has lyrics: a single-staff part named like a voice (when that singles it
+// out), else a monophonic line in a singable register — preferring a part that is that one line on its own (the
+// first such part in score order: piano-vocal scores put the voice on top, and a broken-chord or arpeggiated right
+// hand can lie higher than the sung line; a line sharing its part with other voices is a piano hand) — else the
+// highest line (like recommendTrack).
+function guessVocal(score, cands) {
+  const internal = score._internal;
+  const infoById = new Map(score.parts.map((p) => [p.id, p]));
+  let pool = cands;
+  const named = cands.filter((t) => {
+    const info = infoById.get(t.partId);
+    return Boolean(info) && info.staves === 1 && VOCAL_NAME_RE.test(info.name || '');
+  });
+  if (named.length && new Set(named.map((t) => t.partId)).size < new Set(cands.map((t) => t.partId)).size) pool = named;
+  const big = pool.filter((t) => t.noteCount >= 8);
+  if (big.length) pool = big;
+  const highest = (list) => list.reduce((a, b) => (b.avgPitch > a.avgPitch + EPS ? b : a));
+  const mono = pool.filter((t) => {
+    if (!(t.avgPitch >= VOCAL_MIN_AVG)) return false;
+    const found = findTrack(score, t.key);
+    return chordShare(internal, found.part, found.def) <= MONO_MAX_CHORDS;
+  });
+  const own = mono.filter((t) => {
+    const info = infoById.get(t.partId);
+    return Boolean(info) && info.noteCount > 0 && t.allNotes >= info.noteCount * SOLO_PART_SHARE;
+  });
+  if (own.length) return own[0];
+  return highest(mono.length ? mono : pool);
+}
+
+/**
+ * Suggested accompaniment setup: { vocalKey, playKeys, hands }. The vocal (lyric timing) track is the one with
+ * the most lyrics, else a guess when there are at least two candidate tracks. Every other single-voice track
+ * with notes is played, except the vocal's own staff — unless that staff is a piano staff (it has chords, or it
+ * belongs to a two-staff grand-staff part that is the only part with notes): then it is played as well. Hands follow the
+ * register (highest lane → 'R', others 'L'); with a single lane `hands` stays empty (split at middle C).
+ */
+export function recommendArrangement(score) {
+  const out = { vocalKey: null, playKeys: [], hands: {} };
+  if (!score || !score._internal) return out;
+  const tracks = allTracks(score);
+  const cands = tracks.filter((t) => t.voice !== null && t.noteCount > 0);
+  if (!cands.length) return out;
+
+  let vocal = null;
+  if (tracks.some((t) => t.lyricCount > 0)) {
+    const key = recommendTrack(score);
+    vocal = tracks.find((t) => t.key === key) || null;
+  } else if (cands.length >= 2) {
+    vocal = guessVocal(score, cands);
+  }
+
+  let play = cands;
+  if (vocal) {
+    const covered = (t) => t.partId === vocal.partId && (vocal.staff === null || t.staff === vocal.staff);
+    const others = cands.filter((t) => !covered(t));
+    const found = findTrack(score, vocal.key);
+    const info = score.parts.find((p) => p.id === vocal.partId);
+    // A grand staff (exactly two staves) whose upper staff carries the tune is a solo piano. With three or more
+    // staves a one-line staff is a sung staff above a piano grand staff (OMR may group the whole system into one
+    // part): it is not played, the piano staves below are.
+    const pianoStaff = chordShare(score._internal, found.part, found.def) > MONO_MAX_CHORDS
+      || (Boolean(info) && info.staves === 2 && others.every((t) => t.partId === vocal.partId));
+    play = pianoStaff || !others.length ? cands : others;
+    out.vocalKey = vocal.key;
+  }
+  out.playKeys = play.map((t) => t.key);
+
+  const lanes = new Map();
+  for (const t of play) {
+    const lane = laneOf(t.partId, t.staff);
+    let a = lanes.get(lane);
+    if (!a) lanes.set(lane, (a = { sum: 0, count: 0, keys: [] }));
+    a.sum += (t.avgPitch || 0) * t.noteCount;
+    a.count += t.noteCount;
+    a.keys.push(t.key);
+  }
+  if (lanes.size >= 2) {
+    let top = null;
+    for (const a of lanes.values()) if (!top || a.sum / a.count > top.sum / top.count + EPS) top = a;
+    for (const a of lanes.values()) for (const k of a.keys) out.hands[k] = a === top ? 'R' : 'L';
+  }
+  return out;
 }

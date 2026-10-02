@@ -481,6 +481,55 @@ body[data-screen="play"] {
   line-height: 1.55;
 }
 
+/* Two-hand accompaniment: chip, judging note and colour legend (matches the highway colours). */
+[data-screen="play"] .pk-acc-chip {
+  border-color: rgba(251, 191, 36, 0.5);
+  background: rgba(251, 191, 36, 0.12);
+  color: #fde68a;
+}
+
+[data-screen="play"] .pk-acc-info {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+[data-screen="play"] .pk-acc-desc {
+  margin: 0;
+  color: #fde68a;
+  font-size: 0.92rem;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+[data-screen="play"] .pk-legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  color: #c9cdf0;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+
+[data-screen="play"] .pk-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+
+[data-screen="play"] .pk-legend-swatch {
+  flex: none;
+  width: 12px;
+  height: 18px;
+  border-radius: 4px;
+}
+
+[data-screen="play"] .is-right .pk-legend-swatch { background: linear-gradient(90deg, #0e7490, #22d3ee 30%, #a5f3fc 50%, #22d3ee 70%, #0e7490); }
+[data-screen="play"] .is-left .pk-legend-swatch { background: linear-gradient(90deg, #b45309, #fbbf24 30%, #fef3c7 50%, #fbbf24 70%, #b45309); }
+[data-screen="play"] .is-vocal .pk-legend-swatch { border: 2px solid rgba(255, 255, 255, 0.55); background: transparent; }
+
 [data-screen="play"] .pk-quick {
   display: flex;
   flex-wrap: wrap;

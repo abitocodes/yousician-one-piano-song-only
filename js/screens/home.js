@@ -18,6 +18,11 @@ export function inputModeInfo(mode) {
 
 const BLACK = new Set([1, 3, 6, 8, 10]);
 
+/** Two-hand accompaniment song (notes = both hands, judged per chord). */
+export function isAccompanimentSong(song) {
+  return !!song && song.arrangement === 'accompaniment';
+}
+
 let cleanups = [];
 let renderToken = 0;
 
@@ -138,8 +143,10 @@ function songArt(song) {
     const x = 6 + ((n.t - start) / span) * (W - 12);
     const w = Math.max(2, (n.d / span) * (W - 12) - 1.5);
     const y = 6 + (1 - (n.m - lo) / Math.max(1, hi - lo)) * (H - 12 - barH);
+    const black = BLACK.has(((Math.round(n.m) % 12) + 12) % 12);
     rects.push(h('rect', {
-      class: BLACK.has(((Math.round(n.m) % 12) + 12) % 12) ? 'b' : 'w',
+      // Left-hand notes of a two-hand song use the play screen's amber / orange.
+      class: n.h === 'L' ? (black ? 'lb' : 'lw') : black ? 'b' : 'w',
       x: x.toFixed(1),
       y: y.toFixed(1),
       width: w.toFixed(1),
@@ -314,6 +321,9 @@ export async function mount(root, params, app) {
     else if (song.builtin) badges.push(h('span', { class: 'badge' }, '기본'));
     if (isOverride) badges.push(h('span', { class: 'badge accent' }, '내가 만든 악보'));
     if (song.audio) badges.push(h('span', { class: 'badge' }, '🎵 반주'));
+    if (isAccompanimentSong(song)) {
+      badges.push(h('span', { class: 'badge amber', title: '양손 반주: 화음 단위로 판정해요' }, '양손'));
+    }
 
     const metaParts = [];
     if (!isTemplate) {

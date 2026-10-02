@@ -1,8 +1,9 @@
 // 곡 편집 화면: 멜로디(노트)·가사·반주 음원을 만들고 저장한다.
 import {
   createSong, normalizeSong, transposeNotes, shiftNotes, quantizeNotes, serializeSong, cloneSong,
-  noteRange, songDuration, isPlayable,
+  noteRange, songDuration, isPlayable, lyricTimingNotes,
 } from '../core/song.js';
+import { simplifyAccompaniment, accompanimentStats, splitHands, JUDGE_FLOOR } from '../core/arrange.js';
 import { parseMidi, extractMelody, midiTracksSummary } from '../core/midi.js';
 import { parseNotation, notesToNotation } from '../core/notation.js';
 import {
@@ -152,30 +153,43 @@ function mapLyricTimes(lyrics, fn) {
   };
 }
 
-/** BPM을 바꾸면서 노트·첫 박·LRC 가사 시간을 같은 비율로 늘이거나 줄인다. */
+/** 초안의 노래 멜로디 (없거나 예전 초안이면 빈 배열). */
+function draftVocal(d) {
+  return d && Array.isArray(d.vocal) ? d.vocal : [];
+}
+
+/** BPM을 바꾸면서 노트·노래 멜로디·첫 박·LRC 가사 시간을 같은 비율로 늘이거나 줄인다. */
 export function scaleTempo(song, newBpm) {
   const f = song.bpm / newBpm;
+  const scale = (n) => ({ ...n, t: round3(n.t * f), d: Math.max(0.01, round3(n.d * f)) });
   return {
     bpm: newBpm,
     offset: round3((song.offset || 0) * f),
-    notes: song.notes.map((n) => ({ ...n, t: round3(n.t * f), d: Math.max(0.01, round3(n.d * f)) })),
+    notes: song.notes.map(scale),
+    vocal: draftVocal(song).map(scale),
     lyrics: song.lyrics && song.lyrics.source === 'lrc'
       ? mapLyricTimes(song.lyrics, (y) => ({ t: round3(y.t * f), d: Math.max(0.01, round3(y.d * f)) }))
       : song.lyrics,
   };
 }
 
-/** 첫 노트가 0초가 되도록 전체(노트·첫 박·음원 오프셋·LRC 가사)를 함께 당긴다. 이미 0이면 null. */
+/**
+ * 첫 노트가 0초가 되도록 전체(노트·노래 멜로디·첫 박·음원 오프셋·LRC 가사)를 함께 당긴다. 이미 0이면 null.
+ * 노래 멜로디가 노트보다 먼저 시작하면 노래 멜로디의 첫 음이 0초가 된다 (둘의 간격은 그대로).
+ */
 export function trimLeadingSilence(song) {
   const notes = song.notes || [];
   if (!notes.length) return null;
+  const vocal = draftVocal(song);
   let first = Infinity;
   for (const n of notes) first = Math.min(first, n.t);
+  for (const n of vocal) first = Math.min(first, n.t);
   if (!(first > 0.0005)) return null;
   const sh = -first;
   return {
     shift: sh,
     notes: shiftNotes(notes, sh),
+    vocal: shiftNotes(vocal, sh),
     offset: round3((song.offset || 0) + sh),
     audio: song.audio ? { ...song.audio, offset: round3((song.audio.offset || 0) + sh) } : song.audio,
     lyrics: song.lyrics && song.lyrics.source === 'lrc'
@@ -299,6 +313,282 @@ export function midiBeatGrid(ts, quarterBpm) {
   };
 }
 
+// --- 양손 반주 + 노래 멜로디 ------------------------------------------------------
+// 양손 반주 곡: notes = 두 손의 반주(화음 단위 판정, h: 'R'|'L'), vocal = 노래 멜로디(판정 안 함, 가사 시간 기준).
+
+/** 화음 줄이기 선택지. 오른손은 위 음부터, 왼손은 아래 음(베이스)부터 남긴다. */
+export const RIGHT_HAND_OPTIONS = [
+  { value: 'all', label: '전부' },
+  { value: 3, label: '최대 3음' },
+  { value: 2, label: '최대 2음' },
+  { value: 1, label: '맨 위 1음' },
+];
+export const LEFT_HAND_OPTIONS = [
+  { value: 'all', label: '전부' },
+  { value: 2, label: '최대 2음' },
+  { value: 1, label: '베이스만' },
+];
+/** 노래하면서 치기 좋은 기본값: 오른손 최대 3음, 왼손 최대 2음(베이스 + 옥타브). */
+export const DEFAULT_SIMPLIFY = Object.freeze({ right: 3, left: 2 });
+
+/** 화음 줄이기 선택값 → simplifyAccompaniment 인자 { right, left } ('all'·잘못된 값 = Infinity = 전부). */
+export function simplifyParams({ right = 'all', left = 'all' } = {}) {
+  const limit = (v) => {
+    const n = Number(v);
+    return Number.isInteger(n) && n >= 1 ? n : Infinity;
+  };
+  return { right: limit(right), left: limit(left) };
+}
+
+/** 노트에 손 표시(h)가 하나라도 있는지. */
+export function hasHandTags(notes) {
+  return (notes || []).some((n) => n && (n.h === 'R' || n.h === 'L'));
+}
+
+/** 같은 시각(±30 ms)에 두 음 이상 치는 곳이 없는 한 줄 멜로디인지. */
+export function isSingleLine(notes) {
+  const list = (notes || []).filter((n) => n && Number.isFinite(n.t));
+  return groupNoteEvents(list).length === list.length;
+}
+
+/**
+ * 가져온 노트 → 앱 노트: 이조하고, 피아노 건반(A0~C8)을 벗어나면 옥타브를 옮겨 개수(= 가사 짝)를 지킨다.
+ * 시간·길이를 정리하고 손 표시(h)는 남긴다. → { notes (정렬), moved (옥타브를 옮긴 음 수) }
+ */
+export function prepareImportNotes(list, transpose = 0) {
+  const semis = Number.isFinite(transpose) ? Math.round(transpose) : 0;
+  let moved = 0;
+  const notes = [];
+  for (const n of list || []) {
+    if (!n || !Number.isFinite(n.t) || !Number.isFinite(n.m)) continue;
+    let m = Math.round(n.m + semis);
+    if (m < 21 || m > 108) moved++;
+    while (m < 21) m += 12;
+    while (m > 108) m -= 12;
+    const out = {
+      t: round3(Math.max(0, n.t)),
+      d: Math.max(0.05, round3(Number.isFinite(n.d) ? n.d : 0.25)),
+      m,
+      v: Number.isFinite(n.v) ? n.v : 0.8,
+    };
+    if (n.h === 'R' || n.h === 'L') out.h = n.h;
+    notes.push(out);
+  }
+  return { notes: sortNotes(notes), moved };
+}
+
+/**
+ * 양손 반주 변환 결과(scoreToArrangement) → 초안에 넣을 값. 반주와 노래 멜로디를 함께 이조하고 반주 화음을 줄인다.
+ * → { notes, vocal, moved, stats (accompanimentStats), end (마지막 음이 끝나는 초) }
+ */
+export function arrangementDraftParts(result, { transpose = 0, right = 'all', left = 'all' } = {}) {
+  const play = prepareImportNotes(result && result.notes, transpose);
+  const sung = prepareImportNotes(result && result.vocal, transpose);
+  const notes = sortNotes(simplifyAccompaniment(play.notes, simplifyParams({ right, left })).slice());
+  let end = 0;
+  for (const n of notes) end = Math.max(end, n.t + n.d);
+  for (const n of sung.notes) end = Math.max(end, n.t + n.d);
+  return { notes, vocal: sung.notes, moved: play.moved + sung.moved, stats: accompanimentStats(notes), end };
+}
+
+/** 가져오기 창의 요약 한 줄. */
+export function arrangementSummaryText({ right = 0, left = 0, vocal = 0, syllables = 0, end = 0 } = {}) {
+  return `오른손 ${right} · 왼손 ${left} · 노래 ${vocal}음 · 가사 ${syllables}음절 · 길이 ${fmtClock(end)}`;
+}
+
+/**
+ * 양손 반주 가져오기 창의 안내 (경고가 아닌 참고). 노래 성부가 없을 때의 안내는 변환 경고(scoreToArrangement)가 한다.
+ * hasVocal: 노래 멜로디가 있는지, scoreLyrics: 악보 가사를 가져오는지, keptLyrics: 지금 가사(그대로 남김)가 있는지,
+ * vocalHasLyrics: 노래 성부에 악보 가사가 있는지.
+ */
+export function arrangementNotices({
+  stats = null, hasVocal = false, scoreLyrics = false, keptLyrics = false, vocalHasLyrics = false,
+} = {}) {
+  const out = [];
+  const s = stats || {};
+  if (s.belowFloor > 0) out.push(`아주 낮은 음 ${s.belowFloor}개(F2 아래)는 화면에만 보이고 판정하지 않아요.`);
+  if ((s.right > 0) !== (s.left > 0)) {
+    out.push(`${s.right > 0 ? '왼손' : '오른손'} 노트가 없어요. 성부의 손을 바꾸거나 「자동」(가운데 도로 나눔)으로 두어 보세요.`);
+  }
+  if (hasVocal && !scoreLyrics) {
+    if (keptLyrics) out.push('지금 가사를 그대로 두고 노래 멜로디에 다시 맞춰요.');
+    else if (vocalHasLyrics) out.push('악보 가사는 가져오지 않아요. 가져온 뒤 가사 칸에 직접 붙여넣을 수 있어요.');
+    else out.push('노래 성부에 가사가 없어요. 가져온 뒤 가사 칸에 붙여넣으면 노래 멜로디에 한 글자씩 맞춰져요.');
+  }
+  return out;
+}
+
+/** '지금 노트 3개', '노래 멜로디', '가사' → '지금 노트 3개, 노래 멜로디와 가사' (바꾸게 될 것 목록). */
+export function joinReplacing(items) {
+  const list = (items || []).filter(Boolean);
+  if (list.length <= 2) return list.join('와 ');
+  return `${list.slice(0, -1).join(', ')}와 ${list[list.length - 1]}`;
+}
+
+/** 가져온 BPM·박자·첫 박을 초안에 넣는다. */
+function applyImportTiming(draft, { bpm, beatsPerBar, offset } = {}) {
+  const b = Number(bpm);
+  if (b > 0) draft.bpm = clamp(Math.round(b * 100) / 100, 30, 300);
+  const bpb = Math.round(Number(beatsPerBar));
+  if (bpb >= 1) draft.beatsPerBar = clamp(bpb, 1, 16);
+  draft.offset = Number.isFinite(offset) ? round3(offset) : 0;
+}
+
+/**
+ * 멜로디(한 줄) 가져오기를 초안에 적용한다 (draft를 직접 바꾼다): 노래 멜로디는 비우고 음 하나씩 판정.
+ * 악보 가사(lyricText)가 있으면 노트 기준 가사로 바꾼다.
+ */
+export function applyMelodyImport(draft, { notes, bpm, beatsPerBar, offset = 0, lyricText = '' } = {}) {
+  draft.notes = notes || [];
+  draft.vocal = [];
+  draft.arrangement = 'melody';
+  applyImportTiming(draft, { bpm, beatsPerBar, offset });
+  if (String(lyricText || '').trim()) draft.lyrics = { text: String(lyricText), source: 'notes', lines: [] };
+  return draft;
+}
+
+/**
+ * 양손 반주 가져오기를 초안에 적용한다 (draft를 직접 바꾼다): 반주 = notes, 노래 멜로디 = vocal, 화음 단위 판정.
+ * 악보 가사(lyricText)가 있으면 노트 기준 가사로 바꾸고, 없으면 지금 가사(붙여넣은 가사·LRC)를 그대로 둔다.
+ * 가사 줄은 화면에서 lyricTimingNotes(노래 멜로디)로 다시 배치한다.
+ */
+export function applyArrangementImport(draft, { notes, vocal, bpm, beatsPerBar, offset = 0, lyricText = '' } = {}) {
+  draft.notes = notes || [];
+  draft.vocal = vocal || [];
+  draft.arrangement = 'accompaniment';
+  applyImportTiming(draft, { bpm, beatsPerBar, offset });
+  if (String(lyricText || '').trim()) draft.lyrics = { text: String(lyricText), source: 'notes', lines: [] };
+  return draft;
+}
+
+/** 노트 도구(이조·시간 이동·박자 맞춤 등)를 연주 노트와 노래 멜로디에 똑같이 적용한 결과 { notes, vocal }. */
+export function mapDraftNotes(draft, fn) {
+  const vocal = draftVocal(draft);
+  return { notes: fn((draft && draft.notes) || []), vocal: vocal.length ? fn(vocal) : [] };
+}
+
+/** 연주 노트와 노래 멜로디를 합친 음역 (이조할 수 있는지 확인용). */
+export function draftNoteRange(draft) {
+  return noteRange([...((draft && draft.notes) || []), ...draftVocal(draft)]);
+}
+
+/**
+ * 노트를 새로 바꾼 뒤(녹음·악보 보고 입력·텍스트·MIDI로 「교체」)의 노래 멜로디와 판정 방식 { vocal, arrangement }.
+ * keepVocal(기본): 노래 멜로디와 판정 방식을 그대로 둔다. 지우면 새 노트가 한 줄일 때 멜로디 판정으로 돌아간다.
+ */
+export function arrangementAfterReplace(draft, notes, { keepVocal = true } = {}) {
+  const vocal = draftVocal(draft);
+  const arrangement = draft && draft.arrangement === 'accompaniment' ? 'accompaniment' : 'melody';
+  if (keepVocal && vocal.length) return { vocal, arrangement };
+  return { vocal: [], arrangement: arrangement === 'accompaniment' && isSingleLine(notes) ? 'melody' : arrangement };
+}
+
+/**
+ * 양손 반주 곡의 노트는 모두 손 표시를 갖게 한다: 표시가 없는 노트(녹음·악보 보고 입력·텍스트로 넣은 음)는
+ * 가운데 도(C4)로 나눈다 (화음 줄이기·손 통계와 같은 규칙이라 화면 색과 숫자가 맞는다). 멜로디 곡이거나 모두 표시가 있으면 그대로.
+ */
+export function ensureHandTags(notes, arrangement) {
+  const list = notes || [];
+  if (arrangement !== 'accompaniment' || list.every((n) => n && (n.h === 'R' || n.h === 'L'))) return list;
+  return splitHands(list);
+}
+
+/** 판정 방식 바꾸기 → { arrangement, notes }. 양손 반주로 바꿀 때 손 표시가 없는 노트는 가운데 도(C4)로 나눠 표시한다. */
+export function switchArrangement(draft, value) {
+  const arrangement = value === 'accompaniment' ? 'accompaniment' : 'melody';
+  return { arrangement, notes: ensureHandTags((draft && draft.notes) || [], arrangement) };
+}
+
+/** 노트를 바꾸거나 더한 뒤: 「교체」면 노래 멜로디·판정 방식을 정하고, 양손 반주 곡이면 새 노트에 손 표시를 붙인다. */
+function afterNotesReplaced(draft, { replace = true, keepVocal = true } = {}) {
+  if (replace) Object.assign(draft, arrangementAfterReplace(draft, draft.notes, { keepVocal }));
+  draft.notes = ensureHandTags(draft.notes, draft.arrangement);
+}
+
+/**
+ * 가져오기 창의 첫 선택값: recommendArrangement 결과에서 악보에 있는 성부만 남긴다.
+ * → { vocalKey: string|null, playKeys: string[], hands: { [key]: 'R'|'L' } }
+ */
+export function arrangementSelection(tracks, rec) {
+  const keys = new Set((tracks || []).map((t) => t && t.key).filter((k) => typeof k === 'string'));
+  const r = rec && typeof rec === 'object' ? rec : {};
+  const vocalKey = typeof r.vocalKey === 'string' && keys.has(r.vocalKey) ? r.vocalKey : null;
+  const playKeys = [...new Set((Array.isArray(r.playKeys) ? r.playKeys : []).filter((k) => keys.has(k)))];
+  const hands = {};
+  const src = r.hands && typeof r.hands === 'object' ? r.hands : {};
+  for (const k of playKeys) if (src[k] === 'R' || src[k] === 'L') hands[k] = src[k];
+  return { vocalKey, playKeys, hands };
+}
+
+/**
+ * 「멜로디 (한 줄)」 탭의 추천 성부. 가사가 있는 악보는 recKey(recommendTrack), 가사가 없으면 양손 반주의 「노래」
+ * 추천을 따른다 — 두 탭과 안내 문구가 같은 줄을 가리키게 (recommendTrack은 화음의 맨 위 음까지 세서 피아노 오른손을
+ * 고르기 쉽다). → 악보에 있는 성부 key (성부가 없으면 null)
+ */
+export function melodyTrackChoice(tracks, recKey, arrInit) {
+  const list = (tracks || []).filter((t) => t && typeof t.key === 'string');
+  const has = (k) => list.some((t) => t.key === k);
+  const vocal = arrInit && arrInit.vocalKey;
+  if (typeof vocal === 'string' && has(vocal) && !list.some((t) => t.lyricCount > 0)) return vocal;
+  if (has(recKey)) return recKey;
+  return list.length ? list[0].key : null;
+}
+
+/** 화음이 많은 성부 (피아노 성부): 화음 음까지 센 노트가 맨 위 음 수보다 15% 넘게 많다. */
+const chordalTrack = (t) => Boolean(t) && Number(t.allNotes) > Number(t.noteCount) * 1.15;
+
+/**
+ * 양손 반주 창에서 「노래」 성부를 key로 바꿀 때의 선택 → { vocalKey, play: string[], hands }.
+ * 노래로 고른 성부는 연주에서 뺀다 (피아노 성부는 그대로: 화음이 많거나, 추천에서도 노래이면서 연주한 성부).
+ * 연주하던 성부를 노래로 바꾸면 앞의 노래 성부가 그 자리와 손을 이어받아 연주된다 (두 성부의 역할 바꾸기).
+ * tracks: TrackInfo 목록, rec: arrangementSelection 결과 (추천).
+ */
+export function arrangementVocalChange({ vocalKey = null, play = [], hands = {} } = {}, key, { tracks = [], rec = null } = {}) {
+  const list = (tracks || []).filter((t) => t && typeof t.key === 'string');
+  const find = (k) => (typeof k === 'string' ? list.find((t) => t.key === k) || null : null);
+  const nextPlay = [...new Set(Array.isArray(play) ? play : [])];
+  const nextHands = { ...(hands && typeof hands === 'object' ? hands : {}) };
+  const t = find(key);
+  const next = t ? t.key : null;
+  const prev = vocalKey;
+  const recPlays = (k) => Boolean(rec) && rec.vocalKey === k && Array.isArray(rec.playKeys) && rec.playKeys.includes(k);
+  if (t && next !== prev && nextPlay.includes(next) && !chordalTrack(t) && !recPlays(next)) {
+    nextPlay.splice(nextPlay.indexOf(next), 1);
+    if (find(prev) && !nextPlay.includes(prev)) {
+      nextPlay.push(prev);
+      if (nextHands[next] === 'R' || nextHands[next] === 'L') nextHands[prev] = nextHands[next];
+      else delete nextHands[prev];
+    }
+  }
+  return { vocalKey: next, play: nextPlay, hands: nextHands };
+}
+
+/**
+ * 창의 선택 → scoreToArrangement 옵션. 연주 성부는 정렬(같은 선택 = 같은 캐시 키), 손은 연주 성부의 'R'/'L'만
+ * (「자동」은 빼서 평균 음높이·가운데 도 기준으로 정하게 한다). bpm은 바꿨을 때만.
+ */
+export function arrangementRequest({
+  vocalKey = null, playKeys = [], hands = {}, verse = 'auto', includeLyrics = true, unfoldRepeats = true, bpm,
+} = {}) {
+  const play = [...new Set(playKeys || [])].filter((k) => typeof k === 'string').sort();
+  const h = {};
+  for (const k of play) if (hands && (hands[k] === 'R' || hands[k] === 'L')) h[k] = hands[k];
+  const req = {
+    vocalKey: typeof vocalKey === 'string' && vocalKey ? vocalKey : null,
+    playKeys: play,
+    hands: h,
+    verse: verseOption(verse),
+    includeLyrics: Boolean(includeLyrics),
+    unfoldRepeats: unfoldRepeats !== false,
+  };
+  if (Number.isFinite(bpm) && bpm > 0) req.bpm = bpm;
+  return req;
+}
+
+function verseOption(v) {
+  return Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : 'auto';
+}
+
 // --- 되돌리기 스냅숏 -----------------------------------------------------------
 
 const BASIC_FIELDS = ['title', 'artist', 'description', 'bpm', 'beatsPerBar', 'offset'];
@@ -311,7 +601,7 @@ function pickBasics(d) {
 }
 
 /**
- * 되돌리기 스냅숏. 노트는 항상 담고, 가사·음원 오프셋·기본 정보는 그 작업이 바꿀 수 있을 때만 담는다.
+ * 되돌리기 스냅숏. 노트·노래 멜로디·판정 방식은 항상 담고, 가사·음원 오프셋·기본 정보는 그 작업이 바꿀 수 있을 때만 담는다.
  * 담지 않은 칸은 되돌릴 때 건드리지 않으므로, 그 뒤에 입력한 가사·오프셋·제목이 사라지지 않는다.
  * 가사를 담을 때는 그때의 음원 오프셋(lyricsAudioOffset)도 적어 둔다: LRC 가사는 음원 기준이라
  * 그 뒤에 오프셋만 바꿨다면 되돌린 가사도 지금 오프셋에 맞게 옮겨야 한다.
@@ -320,6 +610,8 @@ export function makeUndoSnapshot(draft, label, { basics = false, lyrics = false,
   return {
     label,
     notes: copyNotes(draft.notes || []),
+    vocal: copyNotes(draftVocal(draft)),
+    arrangement: draft.arrangement === 'accompaniment' ? 'accompaniment' : 'melody',
     lyrics: lyrics ? copyLyrics(draft.lyrics) : null,
     lyricsAudioOffset: lyrics ? lrcAudioOffset(draft) : null,
     audioOffset: audio && draft.audio && Number.isFinite(draft.audio.offset) ? draft.audio.offset : null,
@@ -361,6 +653,9 @@ export function sealUndoSnapshot(snap, draft) {
 export function applyUndoSnapshot(draft, snap) {
   if (!draft || !snap) return draft;
   if (Array.isArray(snap.notes)) draft.notes = snap.notes;
+  // 예전 스냅숏(미리듣기에서 돌아온 되돌리기 목록)에는 노래 멜로디·판정 방식이 없다 → 그대로
+  if (Array.isArray(snap.vocal)) draft.vocal = snap.vocal;
+  if (snap.arrangement === 'melody' || snap.arrangement === 'accompaniment') draft.arrangement = snap.arrangement;
   if (draft.audio && Number.isFinite(snap.audioOffset)) draft.audio.offset = snap.audioOffset;
   if (snap.lyrics) {
     const at = snap.lyricsAudioOffset;
@@ -950,8 +1245,15 @@ function syncRecovery(s) {
   else dropSessionRecovery(s);
 }
 
+/** 초안에 노래 멜로디·판정 방식 칸이 늘 있도록 (예전 곡: 노래 멜로디 없음, 멜로디 판정). */
+function withArrangementFields(song) {
+  if (!Array.isArray(song.vocal)) song.vocal = [];
+  if (song.arrangement !== 'accompaniment') song.arrangement = 'melody';
+  return song;
+}
+
 function newSong() {
-  const song = createSong({ artist: '' });
+  const song = withArrangementFields(createSong({ artist: '' }));
   song.title = '';
   return song;
 }
@@ -959,7 +1261,7 @@ function newSong() {
 /** normalizeSong + 빈 제목 유지 (normalizeSong은 빈 제목을 '제목 없음'으로 채운다). */
 function normalizeSafe(raw) {
   try {
-    const song = normalizeSong(cloneSong(raw));
+    const song = withArrangementFields(normalizeSong(cloneSong(raw)));
     if (raw && typeof raw.title === 'string' && !raw.title.trim()) song.title = '';
     return song;
   } catch (err) {
@@ -1289,7 +1591,8 @@ function buildGuide(s) {
     s.templateDesc ? el('p', { class: 'ed-guide-desc' }, s.templateDesc) : null,
     el('ol', { class: 'ed-guide-steps' },
       el('li', null, el('b', null, '멜로디'), ' — 「악보 파일 가져오기」(MIDI·MusicXML), 「악보 보고 입력」, 피아노를 직접 쳐서 「피아노로 녹음」, '
-        + '또는 「텍스트로 입력」으로 노트를 만들어요.'),
+        + '또는 「텍스트로 입력」으로 노트를 만들어요. 피아노 반주를 양손으로 치면서 노래하려면 MusicXML을 가져올 때 '
+        + '「양손 반주 + 노래 가사」를 고르세요.'),
       el('li', null, el('b', null, '가사'), ' — 가사를 붙여넣고 「노트에 자동 배치」를 누르면 한 글자마다 노트 하나씩 연결돼요. '
         + 'MusicXML 악보에 가사가 있으면 함께 들어와요.'),
       el('li', null, el('b', null, '확인'), ' — 「미리듣기」와 「연습해보기」로 확인한 뒤 「저장」하세요.'),
@@ -1371,8 +1674,10 @@ function buildBasics(s) {
     type: 'text', class: 'ed-input', maxlength: 200, placeholder: '곡 카드에 보일 짧은 설명 (선택)', autocomplete: 'off',
     onInput: (e) => { s.draft.description = e.target.value; markDirty(s); },
   });
+  ui.arrBox = el('div', { class: 'ed-arr', hidden: true });
 
   return card('기본 정보',
+    ui.arrBox,
     el('div', { class: 'ed-grid2' },
       field('제목 *', ui.title, 'title', s),
       field('아티스트', ui.artist, null, s),
@@ -1483,6 +1788,7 @@ function buildNotes(s) {
   ui.rollWrap = el('div', { class: 'ed-roll-wrap' }, ui.canvas);
 
   ui.selInfo = el('span', { class: 'ed-sel-info' });
+  ui.handBtn = btn('손 바꾸기', () => editSel(s, 'hand'), 'small', { title: '이 노트를 오른손 ↔ 왼손으로 바꿔요', hidden: true });
   ui.selBar = el('div', { class: 'ed-selbar', hidden: true },
     ui.selInfo,
     el('div', { class: 'ed-selbar-btns' },
@@ -1492,6 +1798,7 @@ function buildNotes(s) {
       btn('▶', () => editSel(s, 'later'), 'small', { title: '16분음표만큼 뒤로', 'aria-label': '뒤로' }),
       btn('짧게', () => editSel(s, 'shorter'), 'small'),
       btn('길게', () => editSel(s, 'longer'), 'small'),
+      ui.handBtn,
       btn('삭제', () => editSel(s, 'delete'), 'small danger'),
       btn('✕', () => selectNote(s, null), 'small ghost', { 'aria-label': '선택 해제' }),
     ),
@@ -1534,15 +1841,12 @@ function buildNotes(s) {
     el('div', { class: 'ed-help' }, sheetHelpList(), sheetHelpNote()),
   );
 
-  return card('멜로디 노트',
+  ui.notesTitle = el('span', null, '멜로디 노트');
+  ui.legend = el('div', { class: 'ed-roll-legend muted' });
+  return card(ui.notesTitle,
     el('div', { class: 'ed-summary-row' }, ui.noteSummary, ui.zoomSeg),
     ui.rollWrap,
-    el('div', { class: 'ed-roll-legend muted' },
-      el('span', { class: 'ed-lg ed-lg-white' }, '흰 건반'),
-      el('span', { class: 'ed-lg ed-lg-black' }, '검은 건반'),
-      el('span', { class: 'ed-lg ed-lg-lyric' }, '가사 줄 시작'),
-      el('span', null, '노트를 누르면 소리를 듣고 고칠 수 있어요'),
-    ),
+    ui.legend,
     ui.selBar,
     sources,
     sheetHelp,
@@ -1603,6 +1907,11 @@ function buildLyrics(s) {
     el('span', null, '시간 표시([00:12.34])가 있는 LRC 가사 같아요.'),
     btn('시간 정보로 가져오기', () => applyLrcText(s, ui.lyrics.value, '붙여넣은 LRC'), 'small primary'),
   );
+  ui.vocalText = el('span');
+  ui.vocalBanner = el('div', { class: 'ed-banner ed-vocal-banner', hidden: true },
+    ui.vocalText,
+    btn('노래 멜로디 지우기', () => clearVocal(s), 'small ghost danger', { title: '노래 멜로디를 지우고 가사를 연주 노트에 맞춰요' }),
+  );
   ui.lyrics = el('textarea', {
     class: 'ed-input ed-lyrics', rows: 10, spellcheck: 'false', autocomplete: 'off', 'aria-label': '가사',
     placeholder: '예)\n[1절]\n손끝으로 톡톡 톡\n소리가 피~어나\n_ 천천히 한 걸음씩',
@@ -1621,6 +1930,7 @@ function buildLyrics(s) {
     el('ul', { class: 'ed-help' },
       el('li', null, '한 줄이 노래방 화면의 한 줄이 돼요.'),
       el('li', null, '한글은 ', el('b', null, '한 글자 = 노트 하나'), '예요. 동시에 치는 화음은 노트 하나로 세요.'),
+      el('li', null, '양손 반주 곡은 연주하는 노트 대신 ', el('b', null, '노래 멜로디'), '의 음 하나에 한 글자씩 맞춰요.'),
       el('li', null, '영어는 단어 하나가 노트 하나예요. ', el('code', null, 'twin-kle'), '처럼 ', el('code', null, '-'), '로 나누면 여러 노트가 돼요.'),
       el('li', null, el('code', null, '~'), ' 앞 글자를 다음 노트까지 길게 늘여요. 예) ', el('code', null, '사~랑해'), ' → "사"가 노트 2개'),
       el('li', null, el('code', null, '_'), ' 가사 없이 노트 하나를 건너뛰어요. (전주·간주 음)'),
@@ -1633,6 +1943,7 @@ function buildLyrics(s) {
 
   return card(el('span', { class: 'ed-h-inner' }, '가사', ui.lyricSource),
     help,
+    ui.vocalBanner,
     ui.lrcBanner,
     ui.pasteBanner,
     ui.lyrics,
@@ -1667,6 +1978,7 @@ function buildAudio(s) {
 function renderAll(s, force = false) {
   renderHeader(s);
   renderBasics(s, force);
+  renderArrangement(s);
   renderNotesSummary(s);
   renderSelection(s);
   renderLyrics(s, force);
@@ -1709,17 +2021,70 @@ function renderGuide(s) {
   s.ui.guide.hidden = s.draft.notes.length > 0;
 }
 
+function isAccompaniment(d) {
+  return Boolean(d) && d.arrangement === 'accompaniment';
+}
+
+/** 기본 정보의 판정 방식 줄: 양손 반주 곡(또는 노래 멜로디·손 표시가 있는 곡)일 때만 보인다. */
+function renderArrangement(s) {
+  const { ui, draft: d } = s;
+  const acc = isAccompaniment(d);
+  const show = acc || draftVocal(d).length > 0 || hasHandTags(d.notes);
+  ui.arrBox.hidden = !show;
+  if (!show) {
+    fill(ui.arrBox);
+    return;
+  }
+  fill(ui.arrBox,
+    el('div', { class: 'ed-arr-main' },
+      el('span', { class: `badge ${acc ? 'ed-badge-arr' : ''}`.trim() }, acc ? '양손 반주' : '멜로디'),
+      el('span', { class: 'ed-arr-text' }, acc
+        ? '화음 단위로 판정해요. 화음은 한 음만 맞아도 인정되고, 아주 낮은 음(F2 아래)은 판정하지 않아요.'
+        : '노트를 하나씩 판정해요. 양손 반주로 바꾸면 화음 단위로 판정해요.')),
+    btn(acc ? '음 하나씩 판정으로 바꾸기' : '양손 반주로 바꾸기', () => setArrangement(s, acc ? 'melody' : 'accompaniment'), 'small', {
+      title: acc ? '멜로디 곡처럼 노트를 하나씩 판정해요' : '화음은 한 음만 맞아도 인정하는 양손 반주 판정으로 바꿔요',
+    }),
+  );
+}
+
+function renderLegend(s) {
+  const d = s.draft;
+  const hands = isAccompaniment(d) || d.notes.some((n) => n.h === 'L');
+  const vocal = draftVocal(d).length > 0;
+  const lg = (cls, text) => el('span', { class: `ed-lg ${cls}` }, text);
+  let below = 0;
+  if (isAccompaniment(d)) for (const n of d.notes) if (n.m < JUDGE_FLOOR) below++;
+  fill(s.ui.legend,
+    hands ? [lg('ed-lg-right', '오른손'), lg('ed-lg-left', '왼손')] : [lg('ed-lg-white', '흰 건반'), lg('ed-lg-black', '검은 건반')],
+    vocal ? lg('ed-lg-vocal', '노래 멜로디 (가사 기준)') : null,
+    lg('ed-lg-lyric', '가사 줄 시작'),
+    below ? el('span', null, '흐린 노트: 판정하지 않는 아주 낮은 음') : null,
+    el('span', null, '노트를 누르면 소리를 듣고 고칠 수 있어요'),
+  );
+}
+
 function renderNotesSummary(s) {
-  const notes = s.draft.notes;
+  const d = s.draft;
+  const notes = d.notes;
+  const vocal = draftVocal(d);
+  const acc = isAccompaniment(d);
+  s.ui.notesTitle.textContent = acc ? '반주 노트 (양손)' : '멜로디 노트';
+  renderLegend(s);
+  const vocalText = vocal.length ? ` · 노래 멜로디 ${vocal.length}음` : '';
   if (!notes.length) {
-    s.ui.noteSummary.textContent = '노트가 아직 없어요';
+    s.ui.noteSummary.textContent = `노트가 아직 없어요${vocalText}`;
     return;
   }
   const r = noteRange(notes);
-  const dur = songDuration({ ...s.draft, lyrics: { ...s.draft.lyrics, lines: [] } });
+  const dur = songDuration({ ...d, lyrics: { ...d.lyrics, lines: [] } });
+  let hands = '';
+  if (acc) {
+    const st = accompanimentStats(notes);
+    hands = ` (오른손 ${st.right} · 왼손 ${st.left})`;
+  }
   fill(s.ui.noteSummary,
     el('b', null, `노트 ${notes.length}개`),
-    ` · 음역 ${r ? rangeText(r.min, r.max) : '-'} · 길이 ${fmtClock(dur)}`,
+    `${hands} · 음역 ${r ? rangeText(r.min, r.max) : '-'}${vocalText} · 길이 ${fmtClock(dur)}`,
   );
 }
 
@@ -1759,9 +2124,11 @@ function renderSelection(s) {
     return;
   }
   ui.selBar.hidden = false;
+  const hands = isAccompaniment(s.draft) || hasHandTags(s.draft.notes);
+  ui.handBtn.hidden = !hands;
   fill(ui.selInfo,
     el('b', null, noteLabel(n.m)),
-    ` · ${fmtClock(n.t, 2)} · ${n.d.toFixed(2)}초`,
+    ` · ${fmtClock(n.t, 2)} · ${n.d.toFixed(2)}초${hands ? ` · ${n.h === 'L' ? '왼손' : '오른손'}` : ''}`,
   );
 }
 
@@ -1776,10 +2143,11 @@ function markDirty(s) {
   }, 1000);
 }
 
-/** 노트가 바뀐 뒤 공통 처리. */
+/** 노트(·노래 멜로디·판정 방식)가 바뀐 뒤 공통 처리. */
 function notesChanged(s, { keepSel = false } = {}) {
   if (!keepSel) s.sel = null;
   refreshLyrics(s);
+  renderArrangement(s);
   renderNotesSummary(s);
   renderSelection(s);
   renderLyrics(s);
@@ -1848,6 +2216,10 @@ function rollColors(s) {
     muted: v('--muted', '#9aa0c3'),
     white: v('--accent-2', '#22d3ee'),
     black: '#a78bfa',
+    leftWhite: '#fbbf24', // 왼손 (연주 화면과 같은 색)
+    leftBlack: '#f97316',
+    vocal: 'rgba(255,255,255,0.55)', // 노래 멜로디: 흐린 테두리
+    floor: 'rgba(251,191,36,0.35)',
     lyric: v('--sung', '#38bdf8'),
     audio: v('--perfect', '#ffd84d'),
     sel: '#ffffff',
@@ -1882,14 +2254,18 @@ function drawRoll(s) {
 
   const d = s.draft;
   const notes = d.notes;
+  const vocal = draftVocal(d);
+  const acc = isAccompaniment(d);
   const lines = currentLines(s);
   let end = 0;
   let mn = 127;
   let mx = 0;
-  for (const n of notes) {
-    end = Math.max(end, n.t + n.d);
-    if (n.m < mn) mn = n.m;
-    if (n.m > mx) mx = n.m;
+  for (const list of [notes, vocal]) {
+    for (const n of list) {
+      end = Math.max(end, n.t + n.d);
+      if (n.m < mn) mn = n.m;
+      if (n.m > mx) mx = n.m;
+    }
   }
   for (const line of lines) for (const y of line.syllables) end = Math.max(end, y.t + y.d);
   const tEnd = Math.max(4, end + 0.5);
@@ -1897,7 +2273,7 @@ function drawRoll(s) {
   const bottom = 16;
   let lo = 60;
   let hi = 74;
-  if (notes.length) {
+  if (notes.length || vocal.length) {
     lo = mn - 2;
     hi = mx + 2;
   }
@@ -1981,13 +2357,45 @@ function drawRoll(s) {
     g.restore();
   }
 
-  // 노트
+  // 판정 하한(F2): 양손 반주 곡에서 이 선 아래 음은 화면에만 보인다
+  if (acc && JUDGE_FLOOR > lo && JUDGE_FLOOR <= hi) {
+    const y = Math.round(yOf(JUDGE_FLOOR) + rowH) + 0.5;
+    g.save();
+    g.strokeStyle = C.floor;
+    g.setLineDash([2, 4]);
+    g.lineWidth = 1;
+    g.beginPath();
+    g.moveTo(0, y);
+    g.lineTo(cssW, y);
+    g.stroke();
+    g.restore();
+  }
+
+  // 노트 (손별 색, 판정하지 않는 아주 낮은 음은 흐리게)
   const h = Math.max(2, rowH - 1);
   for (const n of notes) {
     const x = n.t * pps;
     const w = Math.max(2, n.d * pps - 1);
-    g.fillStyle = isBlackKey(n.m) ? C.black : C.white;
+    const black = isBlackKey(n.m);
+    g.fillStyle = n.h === 'L' ? (black ? C.leftBlack : C.leftWhite) : (black ? C.black : C.white);
+    g.globalAlpha = acc && n.m < JUDGE_FLOOR ? 0.4 : 1;
     g.fillRect(x, yOf(n.m) + (rowH - h) / 2, w, h);
+  }
+  g.globalAlpha = 1;
+
+  // 노래 멜로디: 채우지 않은 흐린 테두리 (반주가 같은 음을 쳐도 보이도록 노트 위에 그린다)
+  if (vocal.length) {
+    g.save();
+    g.strokeStyle = C.vocal;
+    g.lineWidth = rowH >= 6 ? 1.5 : 1;
+    g.setLineDash([]);
+    const vh = Math.max(2, rowH - 1);
+    for (const n of vocal) {
+      const x = n.t * pps;
+      const w = Math.max(3, n.d * pps - 1);
+      g.strokeRect(x + 0.5, yOf(n.m) + (rowH - vh) / 2 + 0.5, w - 1, Math.max(1, vh - 1));
+    }
+    g.restore();
   }
   // 옥타브(C) 이름표는 노트 위에 그린다
   g.font = `10px ${C.font}`;
@@ -2013,7 +2421,7 @@ function drawRoll(s) {
     g.fillStyle = C.muted;
     g.font = `14px ${C.font}`;
     g.textAlign = 'center';
-    g.fillText('아직 노트가 없어요', cssW / 2, cssH / 2 + 5);
+    g.fillText(vocal.length ? '아직 연주할 노트가 없어요 (테두리는 노래 멜로디)' : '아직 노트가 없어요', cssW / 2, cssH / 2 + 5);
     g.textAlign = 'start';
   }
 }
@@ -2060,7 +2468,7 @@ function editSel(s, action) {
   const step = round3(60 / s.draft.bpm / 4);
   const labels = {
     up: '반음 올리기', down: '반음 내리기', earlier: '앞으로 옮기기', later: '뒤로 옮기기',
-    shorter: '짧게', longer: '길게', delete: '노트 삭제',
+    shorter: '짧게', longer: '길게', delete: '노트 삭제', hand: '손 바꾸기',
   };
   pushUndo(s, labels[action] || '노트 수정');
   switch (action) {
@@ -2071,6 +2479,7 @@ function editSel(s, action) {
     case 'shorter': n.d = Math.max(0.05, round3(n.d - step)); break;
     case 'longer': n.d = round3(n.d + step); break;
     case 'delete': notes.splice(notes.indexOf(n), 1); break;
+    case 'hand': n.h = n.h === 'L' ? 'R' : 'L'; break;
     default: break;
   }
   if (action === 'delete') {
@@ -2162,23 +2571,30 @@ function requireNotes(s) {
   return false;
 }
 
+/** 노트 도구를 연주 노트와 노래 멜로디에 함께 적용한다 (가사가 노래 멜로디를 따라가므로 둘이 어긋나지 않게). */
+function applyNoteTool(s, fn) {
+  const res = mapDraftNotes(s.draft, fn);
+  s.draft.notes = res.notes;
+  s.draft.vocal = res.vocal;
+}
+
 function toolTranspose(s, semis) {
   if (!requireNotes(s)) return;
-  const r = noteRange(s.draft.notes);
+  const r = draftNoteRange(s.draft);
   if (r && (r.min + semis < 21 || r.max + semis > 108)) {
     s.app.toast('피아노 건반(A0~C8) 범위를 벗어나는 음이 있어서 바꿀 수 없어요.', 'error');
     return;
   }
   const label = Math.abs(semis) === 12 ? `옥타브 ${semis > 0 ? '+' : '−'}` : `반음 ${semis > 0 ? '+' : '−'}`;
   pushUndo(s, label);
-  s.draft.notes = transposeNotes(s.draft.notes, semis);
+  applyNoteTool(s, (list) => transposeNotes(list, semis));
   notesChanged(s);
 }
 
 function toolShift(s, sec) {
   if (!requireNotes(s)) return;
   pushUndo(s, `시간 ${fmtSec(sec)}`);
-  s.draft.notes = shiftNotes(s.draft.notes, sec);
+  applyNoteTool(s, (list) => shiftNotes(list, sec));
   notesChanged(s);
 }
 
@@ -2192,6 +2608,7 @@ function toolTrim(s) {
   pushUndo(s, '앞 공백 제거', { basics: true, lyrics: true, audio: true });
   const d = s.draft;
   d.notes = res.notes;
+  d.vocal = res.vocal;
   d.offset = res.offset;
   d.audio = res.audio;
   d.lyrics = res.lyrics;
@@ -2203,9 +2620,10 @@ function toolTrim(s) {
 
 async function toolClear(s) {
   if (!requireNotes(s)) return;
+  const nv = draftVocal(s.draft).length;
   const ok = await confirmDialog({
     title: '노트를 모두 지울까요?',
-    message: `노트 ${s.draft.notes.length}개를 지워요. 「되돌리기」로 다시 살릴 수 있어요.`,
+    message: `노트 ${s.draft.notes.length}개를 지워요.${nv ? ` 노래 멜로디(${nv}음)는 남아요.` : ''} 「되돌리기」로 다시 살릴 수 있어요.`,
     okText: '모두 지우기',
     cancelText: '취소',
     danger: true,
@@ -2214,6 +2632,57 @@ async function toolClear(s) {
   pushUndo(s, '모두 지우기');
   s.draft.notes = [];
   notesChanged(s);
+}
+
+/**
+ * 지금 노트를 새 노트로 바꾸기 전에(녹음·악보 보고 입력·텍스트·MIDI로 「교체」): 노래 멜로디가 있으면 남길지 묻는다.
+ * → true(남김, 기본) | false(지움) | null(취소). 노래 멜로디나 바꿀 노트가 없으면 묻지 않고 true.
+ */
+async function askKeepVocal(s, what) {
+  const nv = draftVocal(s.draft).length;
+  if (!nv || !s.draft.notes.length) return true;
+  const choice = await choose(s, {
+    title: '노래 멜로디를 남길까요?',
+    message: `${what} 지금 노트 ${s.draft.notes.length}개가 바뀌어요. 가사가 따라가는 노래 멜로디(${nv}음)는 따로 있어요.`,
+    options: [
+      { value: 'keep', label: '노래 멜로디 남기기 — 가사는 지금처럼 노래 멜로디에 맞춰져요', cls: 'primary' },
+      { value: 'drop', label: '노래 멜로디 지우기 — 가사를 새 노트에 맞춰요' },
+    ],
+  });
+  if (s.disposed || !choice) return null;
+  return choice === 'keep';
+}
+
+/** 판정 방식 바꾸기 (기본 정보의 「양손 반주」 줄). */
+function setArrangement(s, value) {
+  const d = s.draft;
+  const next = switchArrangement(d, value);
+  if (next.arrangement === (isAccompaniment(d) ? 'accompaniment' : 'melody')) return;
+  pushUndo(s, next.arrangement === 'accompaniment' ? '양손 반주로 바꾸기' : '음 하나씩 판정으로 바꾸기');
+  d.arrangement = next.arrangement;
+  d.notes = next.notes;
+  notesChanged(s);
+  s.app.toast(next.arrangement === 'accompaniment'
+    ? '양손 반주로 바꿨어요. 화음은 한 음만 맞아도 인정돼요.'
+    : '노트를 하나씩 판정하도록 바꿨어요.', 'success');
+}
+
+async function clearVocal(s) {
+  const nv = draftVocal(s.draft).length;
+  if (!nv) return;
+  const ok = await confirmDialog({
+    title: '노래 멜로디를 지울까요?',
+    message: `노래 멜로디 ${nv}음을 지워요. 가사는 연주 노트에 맞춰 다시 배치되고, 연주 화면의 노래 멜로디 안내도 사라져요. `
+      + '「되돌리기」로 되살릴 수 있어요.',
+    okText: '지우기',
+    cancelText: '취소',
+    danger: true,
+  });
+  if (!ok || s.disposed) return;
+  pushUndo(s, '노래 멜로디 지우기');
+  s.draft.vocal = [];
+  notesChanged(s, { keepSel: true });
+  s.app.toast('노래 멜로디를 지웠어요. 가사는 연주 노트에 맞춰져요.', 'success');
 }
 
 function openTempoDialog(s) {
@@ -2252,6 +2721,7 @@ function openTempoDialog(s) {
     d.bpm = res.bpm;
     d.offset = res.offset;
     d.notes = res.notes;
+    d.vocal = res.vocal;
     d.lyrics = res.lyrics;
     m.close();
     renderBasics(s, true);
@@ -2261,7 +2731,7 @@ function openTempoDialog(s) {
   m = openModal(s, {
     title: '빠르기 바꾸기',
     content: el('div', { class: 'ed-dialog' },
-      el('p', null, `지금 BPM ${d.bpm}. 노트·첫 박 위치·LRC 가사 시간을 새 빠르기에 맞춰 늘이거나 줄여요. 반주 음원은 바뀌지 않아요.`),
+      el('p', null, `지금 BPM ${d.bpm}. 노트${draftVocal(d).length ? '·노래 멜로디' : ''}·첫 박 위치·LRC 가사 시간을 새 빠르기에 맞춰 늘이거나 줄여요. 반주 음원은 바뀌지 않아요.`),
       el('label', { class: 'ed-field' }, el('span', { class: 'ed-label' }, '새 BPM'), input),
       info,
       el('div', { class: 'ed-modal-actions' },
@@ -2278,7 +2748,8 @@ function openQuantizeDialog(s) {
   let m = null;
   const apply = () => {
     pushUndo(s, '박자 맞춤');
-    s.draft.notes = quantizeNotes(s.draft.notes, s.draft.bpm, s.draft.offset, division);
+    const { bpm, offset } = s.draft;
+    applyNoteTool(s, (list) => quantizeNotes(list, bpm, offset, division));
     m.close();
     notesChanged(s);
     s.app.toast(`노트를 ${division === 2 ? '8분' : division === 4 ? '16분' : '4분'}음표 격자에 맞췄어요.`, 'success');
@@ -2318,7 +2789,7 @@ function showNotationErrors(s, errors, onForce) {
   box.hidden = false;
 }
 
-function applyNotation(s, mode, force = false) {
+async function applyNotation(s, mode, force = false) {
   const text = s.ui.notation.value;
   s.notationText = text;
   if (!text.trim()) {
@@ -2349,8 +2820,13 @@ function applyNotation(s, mode, force = false) {
     s.app.toast('적용할 음이 없어요.', 'error');
     return;
   }
-  pushUndo(s, mode === 'append' ? '텍스트 뒤에 추가' : '텍스트 적용');
-  d.notes = mode === 'append' ? sortNotes([...d.notes, ...res.notes]) : res.notes;
+  const replace = mode !== 'append';
+  const keepVocal = replace ? await askKeepVocal(s, '「적용 (교체)」하면') : true;
+  if (keepVocal == null || s.disposed) return;
+  const dr = s.draft; // 묻는 동안 저장이 끝나 초안이 바뀌었을 수 있다
+  pushUndo(s, replace ? '텍스트 적용' : '텍스트 뒤에 추가');
+  dr.notes = replace ? res.notes : sortNotes([...dr.notes, ...res.notes]);
+  afterNotesReplaced(dr, { replace, keepVocal });
   notesChanged(s);
   s.app.toast(`노트 ${res.notes.length}개를 ${mode === 'append' ? '뒤에 추가했어요' : '적용했어요'}.`, 'success');
 }
@@ -2399,7 +2875,8 @@ function refreshLyrics(s) {
     return;
   }
   try {
-    s.lyricResult = assignLyrics(text, s.draft.notes);
+    // 노래 멜로디가 있으면 가사는 노래 멜로디에, 없으면 연주 노트에 맞춘다
+    s.lyricResult = assignLyrics(text, lyricTimingNotes(s.draft));
   } catch (err) {
     console.error(err);
     s.lyricResult = { lines: [], warnings: ['가사를 처리하지 못했어요. 특수 문자를 확인해 주세요.'], stats: null };
@@ -2430,8 +2907,14 @@ function renderLyrics(s, forceText = false) {
   ui.lyrics.classList.toggle('readonly', isLrc);
   ui.lrcBanner.hidden = !isLrc;
   ui.pasteBanner.hidden = isLrc || !looksLikeLrc(ui.lyrics.value);
-  ui.lyricSource.textContent = isLrc ? 'LRC 시간' : '노트 기준';
+  const nv = draftVocal(s.draft).length;
+  ui.lyricSource.textContent = isLrc ? 'LRC 시간' : nv ? '노래 멜로디 기준' : '노트 기준';
   ui.lyricSource.classList.toggle('lrc', isLrc);
+  ui.lyricSource.classList.toggle('vocal', !isLrc && nv > 0);
+  ui.vocalBanner.hidden = nv === 0;
+  ui.vocalText.textContent = isLrc
+    ? `노래 멜로디(${nv}음)가 있어요. 지금 가사는 LRC 시간으로 보여요.`
+    : `가사는 노래 멜로디(${nv}음)에 맞춰 배치돼요. 연주하는 반주 노트와는 따로예요.`;
   renderLyricPreview(s);
 }
 
@@ -2439,9 +2922,10 @@ function renderLyricPreview(s) {
   const { ui } = s;
   const r = s.lyricResult;
   const lines = currentLines(s);
+  const vocal = draftVocal(s.draft).length > 0;
   if (!r) {
-    ui.lyricStats.textContent = s.draft.notes.length
-      ? '가사를 입력하면 노트에 맞춰 자동으로 배치해 미리 보여줘요.'
+    ui.lyricStats.textContent = lyricTimingNotes(s.draft).length
+      ? `가사를 입력하면 ${vocal ? '노래 멜로디' : '노트'}에 맞춰 자동으로 배치해 미리 보여줘요.`
       : '가사는 노트가 있어야 시간에 맞게 배치돼요.';
     ui.lyricWarn.hidden = true;
     fill(ui.lyricWarn);
@@ -2450,7 +2934,9 @@ function renderLyricPreview(s) {
     return;
   }
   if (r.stats) {
-    ui.lyricStats.textContent = `가사 ${lines.length}줄 · 음절 ${r.stats.syllables}개 · 노트 ${r.stats.events}개 (동시에 치는 화음은 1개)`;
+    ui.lyricStats.textContent = vocal
+      ? `가사 ${lines.length}줄 · 음절 ${r.stats.syllables}개 · 노래 멜로디 ${r.stats.events}음`
+      : `가사 ${lines.length}줄 · 음절 ${r.stats.syllables}개 · 노트 ${r.stats.events}개 (동시에 치는 화음은 1개)`;
   } else {
     ui.lyricStats.textContent = `가사 ${lines.length}줄 · LRC 시간 사용`;
   }
@@ -2486,12 +2972,13 @@ function autoPlaceLyrics(s) {
   scheduleRoll(s);
   markDirty(s);
   const r = s.lyricResult;
-  if (!s.draft.notes.length) {
+  if (!lyricTimingNotes(s.draft).length) {
     s.app.toast('노트가 없어서 임시 시간으로 배치했어요. 멜로디를 만든 뒤 다시 눌러 주세요.', 'error');
   } else if (r && r.warnings && r.warnings.length) {
     s.app.toast(r.warnings[0], 'error');
   } else {
-    s.app.toast(`가사 ${currentLines(s).length}줄을 노트에 딱 맞게 배치했어요.`, 'success');
+    const target = draftVocal(s.draft).length ? '노래 멜로디' : '노트';
+    s.app.toast(`가사 ${currentLines(s).length}줄을 ${target}에 딱 맞게 배치했어요.`, 'success');
   }
   s.ui.lyricPreviewBox.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
 }
@@ -2508,24 +2995,28 @@ function switchToNotes(s) {
 }
 
 async function fillSolfege(s) {
-  if (!requireNotes(s)) return;
+  if (!lyricTimingNotes(s.draft).length) {
+    requireNotes(s);
+    return;
+  }
+  const target = draftVocal(s.draft).length ? '노래 멜로디' : '노트';
   const cur = s.ui.lyrics.value.trim();
   if (cur) {
     const ok = await confirmDialog({
       title: '가사를 계이름으로 바꿀까요?',
-      message: '지금 가사를 지우고 노트의 계이름(도레미)으로 채워요. 「되돌리기」로 되살릴 수 있어요.',
+      message: `지금 가사를 지우고 ${target}의 계이름(도레미)으로 채워요. 「되돌리기」로 되살릴 수 있어요.`,
       okText: '계이름으로 채우기',
       cancelText: '취소',
     });
     if (!ok || s.disposed) return;
   }
   pushUndo(s, '계이름으로 채우기', { lyrics: true });
-  s.draft.lyrics = { text: solfegeLyricText(s.draft.notes), source: 'notes', lines: [] };
+  s.draft.lyrics = { text: solfegeLyricText(lyricTimingNotes(s.draft)), source: 'notes', lines: [] };
   refreshLyrics(s);
   renderLyrics(s, true);
   scheduleRoll(s);
   markDirty(s);
-  s.app.toast('노트의 계이름으로 가사를 채웠어요.', 'success');
+  s.app.toast(`${target}의 계이름으로 가사를 채웠어요.`, 'success');
 }
 
 function applyLrcText(s, text, label = 'LRC 가져오기') {
@@ -3128,15 +3619,18 @@ function openMidiImport(s, file, bytes) {
     el('div', { class: 'ed-modal-actions' }, btn('취소', () => m.close(), 'ghost'), applyBtn),
   );
 
-  const apply = () => {
+  const apply = async () => {
     let notes = collect();
     if (!notes.length) return;
     notes = transposeNotes(notes, st.transpose).map((n) => ({
       t: round3(Math.max(0, n.t)), d: Math.max(0.05, round3(n.d)), m: n.m, v: Number.isFinite(n.v) ? n.v : 0.8,
     }));
+    const keepVocal = await askKeepVocal(s, 'MIDI를 가져오면');
+    if (keepVocal == null || s.disposed) return;
     const d = s.draft;
     pushUndo(s, 'MIDI 가져오기', { basics: true });
     d.notes = sortNotes(notes);
+    afterNotesReplaced(d, { keepVocal });
     if (st.tempo) {
       d.bpm = grid.bpm;
       d.beatsPerBar = grid.beatsPerBar;
@@ -3215,6 +3709,7 @@ async function openMusicXmlImport(s, file, bytes) {
     return;
   }
   const trackOf = (key) => tracks.find((t) => t.key === key) || tracks[0];
+  const findTrack = (key) => (key == null ? null : tracks.find((t) => t.key === key) || null);
   const versesOf = (key) => {
     const part = parts.find((p) => p && p.id === trackOf(key).partId);
     return [...new Set(((part && part.verses) || []).map(Number).filter((v) => Number.isInteger(v) && v > 0))]
@@ -3227,6 +3722,21 @@ async function openMusicXmlImport(s, file, bytes) {
     console.error(err);
   }
   if (!tracks.some((t) => t.key === recKey)) recKey = tracks[0].key;
+
+  // 양손 반주: 떨어지는 노트 = 「연주」 성부들(손 지정), 가사·노래 안내 = 「노래」 성부
+  const canArrange = typeof mx.scoreToArrangement === 'function';
+  let recArr = null;
+  if (canArrange && typeof mx.recommendArrangement === 'function') {
+    try {
+      recArr = mx.recommendArrangement(score);
+    } catch (err) {
+      console.error(err);
+    }
+  }
+  const arrInit = arrangementSelection(tracks, recArr);
+  const pianoVocal = canArrange && arrInit.playKeys.some((k) => k !== arrInit.vocalKey) && arrInit.vocalKey != null;
+  // 가사가 없는 악보에서는 두 탭이 같은 노래 줄을 추천하게
+  recKey = melodyTrackChoice(tracks, recKey, arrInit);
 
   const scoreTempo = Number(score.tempo);
   const ts = score.timeSignature && score.timeSignature.num ? score.timeSignature : { num: 4, den: 4 };
@@ -3243,17 +3753,33 @@ async function openMusicXmlImport(s, file, bytes) {
   }
   const unitName = { 1: '온음표', 2: '2분음표', 4: '4분음표', 8: '8분음표', 16: '16분음표' }[beatUnit] || '';
   const st = {
+    mode: canArrange && isAccompaniment(s.draft) ? 'arrange' : 'melody',
     key: recKey,
     verse: 'auto',
-    lyrics: trackOf(recKey).lyricCount > 0,
+    lyrics: false,
     lyricsTouched: false,
     unfold: true,
     melodyOnly: true,
     transpose: 0,
     bpmText: String(baseBpm),
     playing: null,
+    vocalKey: arrInit.vocalKey,
+    play: new Set(arrInit.playKeys),
+    hands: new Map(Object.entries(arrInit.hands)),
+    right: DEFAULT_SIMPLIFY.right,
+    left: DEFAULT_SIMPLIFY.left,
   };
   const cache = new Map();
+  const arranging = () => st.mode === 'arrange';
+  /** 가사를 가져올 성부: 멜로디는 고른 성부, 양손 반주는 「노래」 성부 (없으면 null). */
+  const lyricKey = () => (arranging() ? st.vocalKey : st.key);
+  const lyricTrack = () => findTrack(lyricKey());
+  const lyricsAvailable = () => {
+    const t = lyricTrack();
+    return Boolean(t && t.lyricCount > 0);
+  };
+  const wantsLyricsNow = () => st.lyrics && lyricsAvailable();
+  st.lyrics = lyricsAvailable();
 
   /** 바꾼 BPM (그대로면 undefined → 악보의 빠르기 지도 사용). 잘못된 값이면 NaN. */
   const bpmOverride = () => {
@@ -3265,13 +3791,13 @@ async function openMusicXmlImport(s, file, bytes) {
   const wantsLyrics = (key) => st.lyrics && trackOf(key).lyricCount > 0;
   /** 고른 절이 이 성부에 없으면 자동. (고른 값은 남겨 두어 다른 성부를 보고 와도 유지된다) */
   const verseFor = (key) => (st.verse !== 'auto' && versesOf(key).includes(st.verse) ? st.verse : 'auto');
-  const convert = (key, { forPreview = false } = {}) => {
+  const convert = (key, { forPreview = false, melodyOnly = st.melodyOnly } = {}) => {
     const bpm = bpmOverride();
     if (Number.isNaN(bpm)) return { error: 'BPM은 30~300 사이로 입력해 주세요.' };
     const opts = {
       trackKey: key,
       verse: key === st.key ? verseFor(key) : 'auto',
-      melodyOnly: st.melodyOnly,
+      melodyOnly,
       unfoldRepeats: st.unfold,
       includeLyrics: forPreview ? false : wantsLyrics(key),
     };
@@ -3289,30 +3815,45 @@ async function openMusicXmlImport(s, file, bytes) {
     cache.set(ck, res);
     return res;
   };
-  /** 이조를 적용한 노트. 피아노 음역을 벗어나는 음은 옥타브를 옮겨 개수(=가사 짝)를 지킨다. */
-  const prepared = (res) => {
-    let moved = 0;
-    const notes = (res.notes || []).filter((n) => n && Number.isFinite(n.t) && Number.isFinite(n.m)).map((n) => {
-      let m = Math.round(n.m + st.transpose);
-      if (m < 21 || m > 108) moved++;
-      while (m < 21) m += 12;
-      while (m > 108) m -= 12;
-      return {
-        t: round3(Math.max(0, n.t)),
-        d: Math.max(0.05, round3(Number.isFinite(n.d) ? n.d : 0.25)),
-        m,
-        v: Number.isFinite(n.v) ? n.v : 0.8,
-      };
+  const playKeysInOrder = () => tracks.filter((t) => st.play.has(t.key)).map((t) => t.key);
+  /** 양손 반주 변환 (모든 성부가 같은 시간축). */
+  const convertArr = () => {
+    const bpm = bpmOverride();
+    if (Number.isNaN(bpm)) return { error: 'BPM은 30~300 사이로 입력해 주세요.' };
+    if (!st.play.size) return { error: '「연주」할 성부를 하나 이상 골라 주세요.' };
+    const req = arrangementRequest({
+      vocalKey: st.vocalKey,
+      playKeys: playKeysInOrder(),
+      hands: Object.fromEntries(st.hands),
+      verse: st.vocalKey ? verseFor(st.vocalKey) : 'auto',
+      includeLyrics: wantsLyricsNow(),
+      unfoldRepeats: st.unfold,
+      bpm,
     });
-    return { notes: sortNotes(notes), moved };
+    const ck = `arr:${JSON.stringify(req)}`;
+    if (cache.has(ck)) return cache.get(ck);
+    let res;
+    try {
+      res = mx.scoreToArrangement(score, req);
+      if (!res || !Array.isArray(res.notes)) throw new Error('악보를 변환하지 못했어요.');
+    } catch (err) {
+      console.error(err);
+      res = { error: err && err.message ? err.message : '악보를 변환하지 못했어요.' };
+    }
+    cache.set(ck, res);
+    return res;
   };
+  const arrParts = (res) => arrangementDraftParts(res, { transpose: st.transpose, right: st.right, left: st.left });
 
   // --- preview -------------------------------------------------------------
-  const playBtns = new Map();
-  const mainPlay = btn('▶ 미리듣기', () => togglePreview(st.key), 'small', { title: '고른 성부의 앞부분을 들어봐요' });
+  const ARR = '\u0000arr'; // 미리듣기: 줄인 화음으로 합친 양손 반주
+  const mainKey = () => (arranging() ? ARR : st.key);
+  const playBtns = [];
+  const mainPlay = btn('▶ 미리듣기', () => togglePreview(mainKey()), 'small');
   const setPlayLabels = () => {
     for (const [key, b] of playBtns) b.textContent = st.playing === key ? '■' : '▶';
-    mainPlay.textContent = st.playing === st.key ? '■ 정지' : '▶ 미리듣기';
+    mainPlay.textContent = st.playing != null && st.playing === mainKey() ? '■ 정지' : '▶ 미리듣기';
+    mainPlay.title = arranging() ? '줄인 화음으로 양손 반주의 앞부분을 들어봐요' : '고른 성부의 앞부분을 들어봐요';
   };
   const stopPreview = () => {
     if (st.playing != null) {
@@ -3321,15 +3862,24 @@ async function openMusicXmlImport(s, file, bytes) {
     }
     setPlayLabels();
   };
+  const previewNotes = (key) => {
+    if (key === ARR) {
+      const res = convertArr();
+      return res.error ? { error: res.error, notes: [] } : { notes: arrParts(res).notes };
+    }
+    // 양손 반주에서 성부 하나 들어보기: 연주 성부는 화음 그대로, 노래만 하는 성부는 멜로디만
+    const melodyOnly = arranging() ? key === st.vocalKey && !st.play.has(key) : st.melodyOnly;
+    const res = convert(key, { forPreview: true, melodyOnly });
+    return res.error ? { error: res.error, notes: [] } : { notes: prepareImportNotes(res.notes, st.transpose).notes };
+  };
   const togglePreview = async (key) => {
     if (st.playing === key) {
       stopPreview();
       return;
     }
-    const res = convert(key, { forPreview: true });
-    const notes = res.error ? [] : prepared(res).notes;
+    const { notes, error } = previewNotes(key);
     if (!notes.length) {
-      s.app.toast(res.error || '들려줄 음이 없어요.', res.error ? 'error' : 'info');
+      s.app.toast(error || '들려줄 음이 없어요.', error ? 'error' : 'info');
       return;
     }
     try {
@@ -3350,33 +3900,102 @@ async function openMusicXmlImport(s, file, bytes) {
       stopPreview();
     }
   };
-
-  // --- track list ------------------------------------------------------------
-  const radioName = `ed-xml-${++idSeq}`;
-  const rows = tracks.map((t) => {
-    const radio = el('input', {
-      type: 'radio', name: radioName, value: t.key, checked: t.key === st.key,
-      onChange: (e) => { if (e.target.checked) selectTrack(t.key); },
-    });
-    const play = el('button', {
+  const makePlayBtn = (key) => {
+    const b = el('button', {
       class: 'btn small ghost ed-track-play', type: 'button', 'aria-label': '들어보기', title: '앞부분 들어보기',
       onClick: (e) => {
         e.preventDefault();
         e.stopPropagation();
-        togglePreview(t.key);
+        togglePreview(key);
       },
     }, '▶');
-    playBtns.set(t.key, play);
-    return el('label', { class: 'ed-track' },
-      radio,
-      el('span', { class: 'ed-track-main' },
-        el('span', { class: 'ed-track-name' },
-          t.label || t.key,
-          t.key === recKey ? el('span', { class: 'badge ed-badge-rec' }, '추천') : null,
-          t.lyricCount > 0 ? el('span', { class: 'badge ed-badge-lyric' }, `가사 ${t.lyricCount}`) : null),
-        el('span', { class: 'ed-track-meta muted' }, `노트 ${t.noteCount}개 · ${rangeText(t.min, t.max)}`)),
-      play);
+    playBtns.push([key, b]);
+    return b;
+  };
+  // allNotes: 화음까지 센 노트 수 (양손 반주 줄은 화음을 그대로 치므로 이 값을 보여 준다).
+  const trackMain = (t, badge, chords = false) => el('span', { class: 'ed-track-main' },
+    el('span', { class: 'ed-track-name' },
+      t.label || t.key,
+      badge ? el('span', { class: 'badge ed-badge-rec' }, badge) : null,
+      t.lyricCount > 0 ? el('span', { class: 'badge ed-badge-lyric' }, `가사 ${t.lyricCount}`) : null),
+    el('span', { class: 'ed-track-meta muted' }, chords && Number.isFinite(t.allNotes)
+      ? `노트 ${t.allNotes}개${t.allNotes > t.noteCount ? ' (화음 포함)' : ''} · ${rangeText(t.allMin, t.allMax)}`
+      : `노트 ${t.noteCount}개 · ${rangeText(t.min, t.max)}`));
+
+  // --- track list: 멜로디 (한 성부) ---------------------------------------------
+  const radioName = `ed-xml-${++idSeq}`;
+  const melodyRows = tracks.map((t) => {
+    const radio = el('input', {
+      type: 'radio', name: radioName, value: t.key, checked: t.key === st.key,
+      onChange: (e) => { if (e.target.checked) selectTrack(t.key); },
+    });
+    return el('label', { class: 'ed-track' }, radio, trackMain(t, t.key === recKey ? '추천' : ''), makePlayBtn(t.key));
   });
+  const melodyTracks = el('div', { class: 'ed-tracks' }, melodyRows);
+
+  // --- track list: 양손 반주 (연주 + 손, 노래) ---------------------------------------
+  const vocalName = `ed-xml-v${++idSeq}`;
+  const handName = { R: '오른손', L: '왼손' };
+  const arrEls = new Map();
+  const arrRows = tracks.map((t) => {
+    const name = t.label || t.key;
+    const playCb = el('input', {
+      type: 'checkbox', checked: st.play.has(t.key), 'aria-label': `${name} 연주`,
+      onChange: (e) => {
+        if (e.target.checked) st.play.add(t.key);
+        else st.play.delete(t.key);
+        syncArrRows();
+        update();
+      },
+    });
+    const handSel = el('select', {
+      class: 'ed-input ed-hand-sel', 'aria-label': `${name} 손`, value: st.hands.get(t.key) || 'auto',
+      title: '「자동」: 여러 성부면 높은 성부가 오른손, 한 성부만 치면 가운데 도(C4)로 나눠요',
+      onChange: (e) => {
+        const v = e.target.value;
+        if (v === 'R' || v === 'L') st.hands.set(t.key, v);
+        else st.hands.delete(t.key);
+        update();
+      },
+    }, el('option', { value: 'R' }, '오른손'), el('option', { value: 'L' }, '왼손'), el('option', { value: 'auto' }, '자동'));
+    const radio = el('input', {
+      type: 'radio', name: vocalName, value: t.key, checked: st.vocalKey === t.key, 'aria-label': `${name} 노래 (가사 기준)`,
+      onChange: (e) => { if (e.target.checked) selectVocal(t.key); },
+    });
+    const badge = t.key === arrInit.vocalKey ? '추천: 노래'
+      : arrInit.playKeys.includes(t.key) ? `추천: ${handName[arrInit.hands[t.key]] || '연주'}` : '';
+    const row = el('div', { class: 'ed-track arr' },
+      trackMain(t, badge, true),
+      el('div', { class: 'ed-arr-ctl' },
+        el('label', { class: 'ed-arr-opt' }, playCb, el('span', null, '연주')),
+        handSel,
+        el('label', { class: 'ed-arr-opt ed-arr-sing' }, radio, el('span', null, '노래', el('span', { class: 'ed-arr-sub' }, ' (가사 기준)')))),
+      makePlayBtn(t.key));
+    arrEls.set(t.key, { row, playCb, handSel, radio });
+    return row;
+  });
+  const noneRadio = el('input', {
+    type: 'radio', name: vocalName, value: '', checked: st.vocalKey == null, 'aria-label': '노래 멜로디 없음',
+    onChange: (e) => { if (e.target.checked) selectVocal(null); },
+  });
+  const noneRow = el('label', { class: 'ed-track arr none' },
+    noneRadio,
+    el('span', { class: 'ed-track-main' },
+      el('span', { class: 'ed-track-name' }, '노래 멜로디 없음'),
+      el('span', { class: 'ed-track-meta muted' }, '반주만 쳐요. 가사는 연주 노트(화음은 1개)에 맞춰요.')));
+  const arrTracks = el('div', { class: 'ed-tracks ed-arr-tracks' }, arrRows, noneRow);
+  const syncArrRows = () => {
+    for (const [key, r] of arrEls) {
+      const on = st.play.has(key);
+      r.playCb.checked = on;
+      r.handSel.value = st.hands.get(key) || 'auto';
+      r.handSel.disabled = !on;
+      r.radio.checked = st.vocalKey === key;
+      r.row.classList.toggle('is-play', on);
+      r.row.classList.toggle('is-vocal', st.vocalKey === key);
+    }
+    noneRadio.checked = st.vocalKey == null;
+  };
 
   // --- options ---------------------------------------------------------------
   const lyricsCb = checkbox(st.lyrics, (v) => {
@@ -3389,16 +4008,31 @@ async function openMusicXmlImport(s, file, bytes) {
   const verseHost = el('div', { class: 'ed-xml-verse-seg' });
   const verseField = el('div', { class: 'ed-field ed-xml-verse' }, el('span', { class: 'ed-label' }, '가사 절'), verseHost);
   const renderVerses = () => {
-    const verses = versesOf(st.key);
-    verseField.hidden = !(wantsLyrics(st.key) && verses.length > 1);
+    const key = lyricKey();
+    const verses = key ? versesOf(key) : [];
+    verseField.hidden = !(key && wantsLyrics(key) && verses.length > 1);
     fill(verseHost, seg([
       { value: 'auto', label: '자동 (반복마다 다음 절)' },
       ...verses.map((v) => ({ value: v, label: `${v}절` })),
-    ], verseFor(st.key), (v) => {
+    ], key ? verseFor(key) : 'auto', (v) => {
       st.verse = v;
       update();
     }, '가사 절'));
   };
+  const melodyOnlyRow = el('label', { class: 'ed-check' },
+    checkbox(st.melodyOnly, (v) => { st.melodyOnly = v; update(); }),
+    el('span', null, '멜로디만 (위 음) ', el('span', { class: 'muted' }, '(화음은 가장 높은 음만 남겨요)')));
+
+  const handOpts = el('div', { class: 'ed-xml-hands' },
+    el('div', { class: 'ed-field' },
+      el('span', { class: 'ed-label' }, '오른손 화음'),
+      seg(RIGHT_HAND_OPTIONS, st.right, (v) => { st.right = v; update(); }, '오른손 화음')),
+    el('div', { class: 'ed-field' },
+      el('span', { class: 'ed-label' }, '왼손'),
+      seg(LEFT_HAND_OPTIONS, st.left, (v) => { st.left = v; update(); }, '왼손')),
+    el('p', { class: 'ed-hint muted' },
+      '화음이 많으면 노래하면서 치기 어려워요. 줄이면 오른손은 위 음부터, 왼손은 아래 음(베이스)부터 남겨요.'),
+  );
 
   const transLabel = el('span', { class: 'ed-val' });
   const bpmInput = el('input', {
@@ -3419,21 +4053,104 @@ async function openMusicXmlImport(s, file, bytes) {
   const bpmHint = el('div', { class: 'ed-hint muted' });
 
   const summary = el('div', { class: 'ed-midi-summary' });
+  const noticeList = el('ul', { class: 'ed-xml-notes muted', hidden: true });
   const warnList = el('ul', { class: 'ed-warns', hidden: true });
   const applyBtn = btn('가져오기', () => apply(), 'primary');
+  const trackLabel = el('div', { class: 'ed-label' });
 
   let updTimer = 0;
   const scheduleUpdate = () => {
     clearTimeout(updTimer);
     updTimer = setTimeout(update, 200);
   };
+  const showError = (msg) => {
+    summary.textContent = msg;
+    warnList.hidden = true;
+    fill(warnList);
+    noticeList.hidden = true;
+    fill(noticeList);
+    applyBtn.disabled = true;
+    mainPlay.disabled = true;
+  };
+  const showWarnings = (warnings) => {
+    warnList.hidden = warnings.length === 0;
+    fill(warnList, ...warnings.slice(0, 12).map((w) => el('li', null, `⚠ ${w}`)),
+      warnings.length > 12 ? el('li', null, `… 외 ${warnings.length - 12}개`) : null);
+  };
+  const replacingNote = (withLyrics) => {
+    const d = s.draft;
+    const items = [];
+    if (d.notes.length) items.push(`지금 노트 ${d.notes.length}개`);
+    if (draftVocal(d).length) items.push('노래 멜로디');
+    if (withLyrics && String(d.lyrics.text || '').trim()) items.push('가사');
+    return items.length ? el('span', { class: 'muted' }, ` — ${joinReplacing(items)}를 바꿔요`) : null;
+  };
+  const resWarnings = (res, moved) => {
+    const warnings = (Array.isArray(res.warnings) ? res.warnings : []).filter(Boolean).map(String);
+    if (moved) warnings.push(`피아노 건반 범위를 벗어난 음 ${moved}개는 한 옥타브씩 옮겼어요.`);
+    return warnings;
+  };
+
+  const updateMelody = () => {
+    const res = convert(st.key);
+    if (res.error) {
+      showError(res.error);
+      return;
+    }
+    const { notes, moved } = prepareImportNotes(res.notes, st.transpose);
+    const withLyrics = wantsLyrics(st.key) && String(res.lyricText || '').trim() !== '';
+    const syllables = withLyrics ? (res.stats && Number.isFinite(res.stats.syllables) ? res.stats.syllables : 0) : 0;
+    let end = 0;
+    for (const n of notes) end = Math.max(end, n.t + n.d);
+    fill(summary, `노트 ${notes.length}개 · 가사 음절 ${syllables}개 · 길이 ${fmtClock(end)}`, replacingNote(withLyrics));
+    const warnings = resWarnings(res, moved);
+    if (withLyrics && !st.melodyOnly) warnings.push('「멜로디만」을 끄면 화음 때문에 가사가 어긋날 수 있어요.');
+    showWarnings(warnings);
+    noticeList.hidden = true;
+    fill(noticeList);
+    applyBtn.disabled = notes.length === 0;
+    mainPlay.disabled = notes.length === 0;
+  };
+
+  const updateArr = () => {
+    const res = convertArr();
+    if (res.error) {
+      showError(res.error);
+      return;
+    }
+    const p = arrParts(res);
+    const withLyrics = wantsLyricsNow() && String(res.lyricText || '').trim() !== '';
+    const syllables = withLyrics ? (res.stats && Number.isFinite(res.stats.syllables) ? res.stats.syllables : 0) : 0;
+    fill(summary,
+      arrangementSummaryText({ right: p.stats.right, left: p.stats.left, vocal: p.vocal.length, syllables, end: p.end }),
+      replacingNote(withLyrics));
+    showWarnings(resWarnings(res, p.moved));
+    const vt = lyricTrack();
+    const notices = arrangementNotices({
+      stats: p.stats,
+      hasVocal: p.vocal.length > 0,
+      scoreLyrics: withLyrics,
+      keptLyrics: s.draft.lyrics.source !== 'lrc' && String(s.draft.lyrics.text || '').trim() !== '',
+      vocalHasLyrics: Boolean(vt && vt.lyricCount > 0),
+    });
+    noticeList.hidden = notices.length === 0;
+    fill(noticeList, ...notices.map((n) => el('li', null, n)));
+    applyBtn.disabled = p.notes.length === 0;
+    mainPlay.disabled = p.notes.length === 0;
+  };
+
   const update = () => {
     clearTimeout(updTimer);
     if (s.disposed) return;
-    const t = trackOf(st.key);
-    lyricsCb.checked = wantsLyrics(st.key);
-    lyricsCb.disabled = !(t.lyricCount > 0);
-    lyricsHint.textContent = t.lyricCount > 0 ? `(이 성부에 가사 ${t.lyricCount}개)` : '(이 성부에는 가사가 없어요)';
+    const lt = lyricTrack();
+    lyricsCb.checked = wantsLyricsNow();
+    lyricsCb.disabled = !lyricsAvailable();
+    if (arranging()) {
+      lyricsHint.textContent = !lt ? '(노래 성부를 고르면 가져올 수 있어요)'
+        : lt.lyricCount > 0 ? `(노래 성부에 가사 ${lt.lyricCount}개)` : '(노래 성부에는 가사가 없어요)';
+    } else {
+      lyricsHint.textContent = lt && lt.lyricCount > 0 ? `(이 성부에 가사 ${lt.lyricCount}개)` : '(이 성부에는 가사가 없어요)';
+    }
     transLabel.textContent = st.transpose === 0 ? '그대로' : `${st.transpose > 0 ? '+' : ''}${st.transpose} 반음`;
     const bpm = bpmOverride();
     bpmHint.textContent = Number.isNaN(bpm)
@@ -3444,63 +4161,70 @@ async function openMusicXmlImport(s, file, bytes) {
           ? `악보에 적힌 빠르기(${baseBpm})를 써요. 중간에 빠르기가 바뀌면 그대로 따라가요.`
           : `악보에 빠르기 표시가 없어서 ${baseBpm}(으)로 시작해요. 필요하면 바꿔 주세요.`;
     bpmInput.classList.toggle('invalid', Number.isNaN(bpm));
-
-    const res = convert(st.key);
-    if (res.error) {
-      summary.textContent = res.error;
-      warnList.hidden = true;
-      fill(warnList);
-      applyBtn.disabled = true;
-      mainPlay.disabled = true;
-      return;
-    }
-    const { notes, moved } = prepared(res);
-    const withLyrics = wantsLyrics(st.key) && String(res.lyricText || '').trim() !== '';
-    const syllables = withLyrics ? (res.stats && Number.isFinite(res.stats.syllables) ? res.stats.syllables : 0) : 0;
-    let end = 0;
-    for (const n of notes) end = Math.max(end, n.t + n.d);
-    const d = s.draft;
-    const replacing = [];
-    if (d.notes.length) replacing.push(`지금 노트 ${d.notes.length}개`);
-    if (withLyrics && String(d.lyrics.text || '').trim()) replacing.push('가사');
-    fill(summary,
-      `노트 ${notes.length}개 · 가사 음절 ${syllables}개 · 길이 ${fmtClock(end)}`,
-      replacing.length ? el('span', { class: 'muted' }, ` — ${replacing.join('와 ')}를 바꿔요`) : null,
-    );
-    const warnings = (Array.isArray(res.warnings) ? res.warnings : []).filter(Boolean).map(String);
-    if (moved) warnings.push(`피아노 건반 범위를 벗어난 음 ${moved}개는 한 옥타브씩 옮겼어요.`);
-    if (withLyrics && !st.melodyOnly) warnings.push('「멜로디만」을 끄면 화음 때문에 가사가 어긋날 수 있어요.');
-    warnList.hidden = warnings.length === 0;
-    fill(warnList, ...warnings.slice(0, 12).map((w) => el('li', null, `⚠ ${w}`)),
-      warnings.length > 12 ? el('li', null, `… 외 ${warnings.length - 12}개`) : null);
-    applyBtn.disabled = notes.length === 0;
-    mainPlay.disabled = notes.length === 0;
+    if (arranging()) updateArr();
+    else updateMelody();
   };
 
   const selectTrack = (key) => {
     if (st.playing != null && st.playing !== key) stopPreview();
     st.key = key;
-    if (!st.lyricsTouched) st.lyrics = trackOf(key).lyricCount > 0;
+    if (!st.lyricsTouched) st.lyrics = lyricsAvailable();
     renderVerses();
     update();
     setPlayLabels();
   };
+  const selectVocal = (key) => {
+    const next = arrangementVocalChange(
+      { vocalKey: st.vocalKey, play: [...st.play], hands: Object.fromEntries(st.hands) }, key, { tracks, rec: arrInit });
+    st.vocalKey = next.vocalKey;
+    st.play = new Set(next.play);
+    st.hands = new Map(Object.entries(next.hands));
+    if (!st.lyricsTouched) st.lyrics = lyricsAvailable();
+    syncArrRows();
+    renderVerses();
+    update();
+  };
 
-  const apply = () => {
-    const res = convert(st.key);
-    if (res.error) return;
-    const { notes } = prepared(res);
-    if (!notes.length) return;
-    const withLyrics = wantsLyrics(st.key) && String(res.lyricText || '').trim() !== '';
+  // --- 가져오는 방식: 멜로디 (한 줄) | 양손 반주 + 노래 가사 ---------------------------
+  const modeHint = el('p', { class: 'ed-hint ed-xml-mode-hint' });
+  const modeSeg = canArrange ? seg([
+    { value: 'melody', label: '멜로디 (한 줄)' },
+    { value: 'arrange', label: '양손 반주 + 노래 가사' },
+  ], st.mode, (v) => switchMode(v), '가져오는 방식') : null;
+  const renderMode = () => {
+    const arr = arranging();
+    if (modeSeg) modeSeg.setValue(st.mode);
+    melodyTracks.hidden = arr;
+    arrTracks.hidden = !arr;
+    melodyOnlyRow.hidden = arr;
+    handOpts.hidden = !arr;
+    trackLabel.textContent = arr
+      ? '성부 고르기 — 「연주」: 칠 피아노 성부와 손, 「노래」: 가사가 따라갈 노래 멜로디 (연주하지 않아요)'
+      : '가져올 성부 (노래 멜로디가 있는 줄을 고르세요)';
+    modeHint.textContent = arr
+      ? '떨어지는 노트는 고른 피아노 성부(양손 반주)예요. 가사와 노래 안내는 「노래」 성부의 멜로디를 따라가요. '
+        + '화음은 한 음만 맞아도 인정돼요.'
+      : pianoVocal
+        ? '노래 멜로디 한 줄을 연주해요. 이 악보에는 피아노 성부가 따로 있어요 — 반주를 양손으로 치면서 노래하려면 '
+          + '「양손 반주 + 노래 가사」를 고르세요.'
+        : '노래 멜로디 한 줄을 연주해요.';
+    modeHint.classList.toggle('muted', arr || !pianoVocal);
+    renderVerses();
+    setPlayLabels();
+  };
+  const switchMode = (v) => {
+    const next = v === 'arrange' && canArrange ? 'arrange' : 'melody';
+    if (next === st.mode) return;
+    stopPreview();
+    st.mode = next;
+    if (!st.lyricsTouched) st.lyrics = lyricsAvailable();
+    renderMode();
+    update();
+  };
+
+  // --- apply ------------------------------------------------------------------
+  const finishApply = (checkLyrics, message) => {
     const d = s.draft;
-    pushUndo(s, '악보 파일 가져오기', { basics: true, lyrics: true });
-    d.notes = notes;
-    const bpm = Number(res.bpm);
-    if (bpm > 0) d.bpm = clamp(Math.round(bpm * 100) / 100, 30, 300);
-    const bpb = Math.round(Number(res.beatsPerBar));
-    if (bpb >= 1) d.beatsPerBar = clamp(bpb, 1, 16);
-    d.offset = Number.isFinite(res.offset) ? round3(res.offset) : 0;
-    if (withLyrics) d.lyrics = { text: String(res.lyricText), source: 'notes', lines: [] };
     if (!d.title.trim()) d.title = String(score.title || fileTitle(file.name)).trim().slice(0, 100);
     if (!String(d.artist || '').trim() && score.composer) d.artist = String(score.composer).trim().slice(0, 100);
     stopPreview();
@@ -3510,10 +4234,44 @@ async function openMusicXmlImport(s, file, bytes) {
     notesChanged(s);
     renderLyrics(s, true);
     const r = s.lyricResult;
-    const lyricWarn = withLyrics && r && r.warnings && r.warnings.length;
-    s.app.toast(`악보에서 노트 ${notes.length}개${withLyrics ? '와 가사' : ''}를 가져왔어요.`
-      + `${lyricWarn ? ' 가사 칸의 안내를 확인해 주세요.' : ''}`, lyricWarn ? 'info' : 'success');
+    const lyricWarn = checkLyrics && r && r.warnings && r.warnings.length;
+    s.app.toast(`${message}${lyricWarn ? ' 가사 칸의 안내를 확인해 주세요.' : ''}`, {
+      type: lyricWarn ? 'info' : 'success',
+      duration: message.length > 60 ? 6000 : undefined,
+    });
   };
+  const applyMelody = () => {
+    const res = convert(st.key);
+    if (res.error) return;
+    const { notes } = prepareImportNotes(res.notes, st.transpose);
+    if (!notes.length) return;
+    const withLyrics = wantsLyrics(st.key) && String(res.lyricText || '').trim() !== '';
+    pushUndo(s, '악보 파일 가져오기', { basics: true, lyrics: true });
+    applyMelodyImport(s.draft, {
+      notes, bpm: res.bpm, beatsPerBar: res.beatsPerBar, offset: res.offset, lyricText: withLyrics ? res.lyricText : '',
+    });
+    finishApply(withLyrics, `악보에서 노트 ${notes.length}개${withLyrics ? '와 가사' : ''}를 가져왔어요.`);
+  };
+  const applyArr = () => {
+    const res = convertArr();
+    if (res.error) return;
+    const p = arrParts(res);
+    if (!p.notes.length) return;
+    const withLyrics = wantsLyricsNow() && String(res.lyricText || '').trim() !== '';
+    const d = s.draft;
+    const keptLyrics = !withLyrics && String(d.lyrics.text || '').trim() !== '';
+    pushUndo(s, '악보 파일 가져오기 (양손 반주)', { basics: true, lyrics: true });
+    applyArrangementImport(d, {
+      notes: p.notes, vocal: p.vocal, bpm: res.bpm, beatsPerBar: res.beatsPerBar, offset: res.offset,
+      lyricText: withLyrics ? res.lyricText : '',
+    });
+    const bits = [`노트 ${p.notes.length}개`];
+    if (p.vocal.length) bits.push(`노래 멜로디 ${p.vocal.length}음`);
+    if (withLyrics) bits.push('가사');
+    const tip = p.vocal.length && !withLyrics && !keptLyrics ? ' 가사 칸에 가사를 붙여넣으면 노래 멜로디에 맞춰 배치돼요.' : '';
+    finishApply(withLyrics || keptLyrics, `양손 반주를 가져왔어요 (${bits.join(' · ')}).${tip}`);
+  };
+  const apply = () => (arranging() ? applyArr() : applyMelody());
 
   const metaBits = [
     file.name,
@@ -3526,16 +4284,17 @@ async function openMusicXmlImport(s, file, bytes) {
       el('b', { class: 'ed-xml-title' }, String(score.title || fileTitle(file.name) || '제목 없는 악보')),
       score.composer ? el('span', { class: 'ed-xml-composer' }, String(score.composer)) : null,
       el('span', { class: 'muted ed-xml-meta' }, metaBits.join(' · '))),
-    el('div', { class: 'ed-label' }, '가져올 성부 (노래 멜로디가 있는 줄을 고르세요)'),
-    el('div', { class: 'ed-tracks' }, rows),
+    modeSeg ? el('div', { class: 'ed-xml-mode' }, modeSeg, modeHint) : null,
+    trackLabel,
+    melodyTracks,
+    arrTracks,
+    handOpts,
     el('div', { class: 'ed-xml-opts' },
       el('label', { class: 'ed-check' }, lyricsCb, el('span', null, '가사도 가져오기 '), lyricsHint),
       el('label', { class: 'ed-check' },
         checkbox(st.unfold, (v) => { st.unfold = v; update(); }),
         el('span', null, '반복 펼치기 ', el('span', { class: 'muted' }, '(도돌이표·1·2번 괄호·D.S.를 순서대로 풀어요)'))),
-      el('label', { class: 'ed-check' },
-        checkbox(st.melodyOnly, (v) => { st.melodyOnly = v; update(); }),
-        el('span', null, '멜로디만 (위 음) ', el('span', { class: 'muted' }, '(화음은 가장 높은 음만 남겨요)'))),
+      melodyOnlyRow,
     ),
     verseField,
     el('div', { class: 'ed-xml-grid' },
@@ -3556,13 +4315,14 @@ async function openMusicXmlImport(s, file, bytes) {
         bpmHint),
     ),
     el('div', { class: 'ed-xml-sum-row' }, mainPlay, summary),
+    noticeList,
     warnList,
     el('div', { class: 'ed-modal-actions' }, btn('취소', () => m.close(), 'ghost'), applyBtn),
   );
 
-  renderVerses();
+  syncArrRows();
+  renderMode();
   update();
-  setPlayLabels();
   const m = openModal(s, {
     title: '악보 파일 가져오기 (MusicXML)',
     content,
@@ -3634,10 +4394,16 @@ async function openStepEntry(s) {
     if (!choice || s.disposed) return;
     mode = choice;
   }
-  openStepPanel(s, mode);
+  let keepVocal = true;
+  if (mode === 'replace') {
+    const keep = await askKeepVocal(s, '「새로 입력」을 완료하면');
+    if (keep == null || s.disposed) return;
+    keepVocal = keep;
+  }
+  openStepPanel(s, mode, { keepVocal });
 }
 
-function openStepPanel(s, mode) {
+function openStepPanel(s, mode, { keepVocal = true } = {}) {
   const d = s.draft;
   const bpm = d.bpm > 0 ? d.bpm : 100;
   const bpb = d.beatsPerBar > 0 ? d.beatsPerBar : 4;
@@ -3647,8 +4413,16 @@ function openStepPanel(s, mode) {
   const existing = append ? copyNotes(d.notes) : [];
   const startTick = append ? stepResumeTick(existing, { bpm, origin }) : 0;
   const existingTicks = existing.map((n) => ({ m: n.m, tick: (n.t - origin) / spt, ticks: n.d / spt }));
-  const lyricText = d.lyrics && d.lyrics.source !== 'lrc' ? String(d.lyrics.text || '') : '';
+  // 「다음 가사」 안내는 가사가 입력하는 노트를 따라갈 때만 (노래 멜로디가 남아 있으면 가사는 노래 멜로디를 따라간다)
+  const lyricsFollowEntry = !(draftVocal(d).length && (append || keepVocal));
+  const lyricText = lyricsFollowEntry && d.lyrics && d.lyrics.source !== 'lrc' ? String(d.lyrics.text || '') : '';
   const lyricBase = append ? groupNoteEvents(existing).length : 0;
+  /** 「완료」했을 때의 초안 노트·노래 멜로디·판정 방식. */
+  const finalParts = () => {
+    const merged = stepMergeNotes(s.draft.notes, st.entries, { bpm, origin, startTick, append });
+    const extra = append ? {} : arrangementAfterReplace(s.draft, merged.notes, { keepVocal });
+    return { merged, extra };
+  };
   const st = {
     entries: [],
     value: 1,
@@ -3670,8 +4444,8 @@ function openStepPanel(s, mode) {
   // 입력 중인 음은 「완료」 전까지 초안에 없으므로, 탭이 정리돼도 남도록 임시 초안을 복구 칸에 쓴다.
   const provisional = () => {
     if (st.closed || !stepNoteCount(st.entries)) return null;
-    const { notes } = stepMergeNotes(s.draft.notes, st.entries, { bpm, origin, startTick, append });
-    return { ...s.draft, notes };
+    const { merged, extra } = finalParts();
+    return { ...s.draft, ...extra, notes: merged.notes };
   };
   s.provisional = provisional;
   const schedulePersist = () => {
@@ -4117,7 +4891,7 @@ function openStepPanel(s, mode) {
   };
 
   const done = () => {
-    const merged = stepMergeNotes(s.draft.notes, st.entries, { bpm, origin, startTick, append });
+    const { merged } = finalParts();
     const notes = merged.added;
     if (!notes.length) {
       s.app.toast('입력한 음이 없어요.');
@@ -4126,6 +4900,7 @@ function openStepPanel(s, mode) {
     const dr = s.draft;
     pushUndo(s, '악보 보고 입력');
     dr.notes = merged.notes;
+    afterNotesReplaced(dr, { replace: !append, keepVocal });
     m.close();
     notesChanged(s);
     s.app.toast(`노트 ${notes.length}개를 ${append ? '이어서 넣었어요' : '넣었어요'}.`, 'success');
@@ -4421,12 +5196,16 @@ function openRecorder(s) {
     return sortNotes(notes);
   };
 
-  const applyRec = (mode) => {
+  const applyRec = async (mode) => {
     if (!rec.raw.length) return;
+    const append = mode === 'append';
+    const keepVocal = append ? true : await askKeepVocal(s, '「교체」하면');
+    if (keepVocal == null || s.rec !== rec || !rec.raw.length) return;
     const notes = placed(mode);
     const d = s.draft;
-    pushUndo(s, mode === 'append' ? '녹음 뒤에 추가' : '녹음으로 교체');
-    d.notes = mode === 'append' ? sortNotes([...d.notes, ...notes]) : notes;
+    pushUndo(s, append ? '녹음 뒤에 추가' : '녹음으로 교체');
+    d.notes = append ? sortNotes([...d.notes, ...notes]) : notes;
+    afterNotesReplaced(d, { replace: !append, keepVocal });
     rec.modal.close();
     notesChanged(s);
     app.toast(`녹음한 노트 ${notes.length}개를 ${mode === 'append' ? '뒤에 추가했어요' : '넣었어요'}.`, 'success');
@@ -4522,11 +5301,13 @@ function finalizeDraft(s, { fallbackTitle = false } = {}) {
   d.artist = String(d.artist || '').trim();
   d.description = String(d.description || '').trim();
   d.notes = sortNotes(d.notes.map((n) => ({ ...n })));
+  d.vocal = sortNotes(draftVocal(d).map((n) => ({ ...n })));
+  d.arrangement = isAccompaniment(d) ? 'accompaniment' : 'melody';
   d.builtin = false;
   d.template = false;
   if (d.lyrics.source !== 'lrc') {
     const text = d.lyrics.text || '';
-    d.lyrics = { text, source: 'notes', lines: text.trim() ? assignLyrics(text, d.notes).lines : [] };
+    d.lyrics = { text, source: 'notes', lines: text.trim() ? assignLyrics(text, lyricTimingNotes(d)).lines : [] };
   }
   d.updatedAt = Date.now();
   return normalizeSong(d);
@@ -4669,6 +5450,8 @@ async function importJson(s) {
   d.beatsPerBar = song.beatsPerBar;
   d.offset = song.offset;
   d.notes = song.notes;
+  d.vocal = draftVocal(song);
+  d.arrangement = isAccompaniment(song) ? 'accompaniment' : 'melody';
   // LRC 가사는 음원 오프셋 기준: 음원 파일이 없어도 가져온 음원 정보(오프셋)를 남겨 두어야
   // 음원을 다시 골랐을 때 오프셋을 이어받고 가사가 두 번 옮겨지지 않는다.
   const hasFile = Boolean(s.audioBlob);

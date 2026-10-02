@@ -20,6 +20,10 @@ const MODE_DESC = {
   listen: '멜로디를 들으며 악보와 가사를 따라가 보세요.',
   calibrate: '노트가 선에 닿는 순간 아무 건반이나 또렷하게 쳐 주세요. 정확한 측정을 위해 메트로놈 소리는 일부러 나지 않아요.',
 };
+const LISTEN_DESC_VOCAL = '반주와 노래 멜로디를 들으며 가사를 따라 불러 보세요.';
+const ACC_DESC = '화음은 한 음만 맞아도 인정돼요 · 아주 낮은 음은 판정하지 않아요';
+const GUIDE_LABEL = '가이드 멜로디';
+const GUIDE_LABEL_VOCAL = '노래 멜로디 듣기 (이어폰 권장)';
 const INPUT_LABEL = { mic: '🎤 마이크', touch: '👆 터치', sim: '🤖 시뮬레이션' };
 const INPUT_DESC = {
   mic: '태블릿을 피아노 위에 두고 마이크가 건반 소리를 잘 들을 수 있게 해 주세요.',
@@ -230,6 +234,40 @@ function hasLyrics(song) {
   return lines.some((l) => l && Array.isArray(l.syllables) && l.syllables.length > 0);
 }
 
+/** Two-hand accompaniment song: chords judged once each, low notes display-only (see GameSession). */
+export function isAccompaniment(song) {
+  return !!song && song.arrangement === 'accompaniment';
+}
+
+/** The song carries a sung melody (guide melody / listen audio, outline guide on the highway). */
+export function hasVocal(song) {
+  return !!song && Array.isArray(song.vocal) && song.vocal.length > 0;
+}
+
+/** Label of the guide-melody toggle: with a sung melody the guide plays that melody. */
+export function guideLabel(song) {
+  return hasVocal(song) ? GUIDE_LABEL_VOCAL : GUIDE_LABEL;
+}
+
+/**
+ * Practice hold banner: [note names, suffix]. In an accompaniment song any one note of the held chord releases
+ * it, so the banner says so; long chords use compact names to fit.
+ */
+export function holdHintParts(midis, { labelStyle = 'solfege', accompaniment = false } = {}) {
+  const uniq = Array.from(new Set((Array.isArray(midis) ? midis : []).map((m) => Math.round(m))))
+    .filter(Number.isFinite).sort((a, b) => a - b);
+  const solfege = labelStyle === 'solfege';
+  const compact = accompaniment && uniq.length > 2;
+  const name = (m) => {
+    if (compact) return noteName(m, solfege ? 'solfege-octave' : 'en');
+    const en = noteName(m, 'en');
+    return solfege ? `${noteName(m, 'solfege')} (${en})` : en;
+  };
+  const names = uniq.map(name).join(' · ');
+  if (accompaniment && uniq.length > 1) return [names, ' 중 하나를 쳐주세요'];
+  return [names, solfege ? ' 을 쳐주세요' : ' 건반을 쳐주세요'];
+}
+
 /** Params that reopen this same song (used by "연주하기" after listening). */
 function songNavParams(st) {
   const p = st.params;
@@ -322,6 +360,7 @@ function buildScreen(st) {
   st.renderer = new HighwayRenderer(e.canvas, {
     labelStyle: st.settings.labelStyle,
     showDetected: st.settings.showDetected !== false,
+    showVocal: st.settings.showVocal !== false,
   });
   st.renderer.setSong(song);
   st.renderer.resize();
@@ -343,7 +382,9 @@ function buildScreen(st) {
 
 function makePreviewSnap(st) {
   const notes = st.song.notes;
-  const first = notes.length ? notes[0].t : 0;
+  const vocal = hasVocal(st.song) ? st.song.vocal : [];
+  let first = notes.length ? notes[0].t : 0;
+  if (vocal.length && (!notes.length || vocal[0].t < first)) first = vocal[0].t;
   return {
     songTime: first - st.lookahead * 0.35,
     state: 'ready',
@@ -351,6 +392,8 @@ function makePreviewSnap(st) {
     speed: 1,
     countdown: null,
     notes,
+    vocal,
+    arrangement: isAccompaniment(st.song) ? 'accompaniment' : 'melody',
     states: null,
     judgedAt: null,
     expectedKeys: new Set(),
@@ -411,8 +454,21 @@ function buildReady(st) {
     e.speedSel = sel;
     quick = h('div', { class: 'pk-quick' },
       h('label', { class: 'pk-quick-speed' }, h('span', { class: 'pk-quick-label' }, '속도'), sel),
-      mode !== 'listen' ? toggleButton(st, '가이드 멜로디', 'guideMelody') : null,
+      mode !== 'listen' ? toggleButton(st, guideLabel(song), 'guideMelody') : null,
       toggleButton(st, '메트로놈', 'metronome'));
+  }
+
+  // Two-hand accompaniment: how it is judged, and what the colours on the highway mean.
+  let accInfo = null;
+  if (isAccompaniment(song) && mode !== 'calibrate') {
+    const item = (cls, label) => h('span', { class: ['pk-legend-item', cls] },
+      h('span', { class: 'pk-legend-swatch', 'aria-hidden': 'true' }), label);
+    accInfo = h('div', { class: 'pk-acc-info' },
+      mode !== 'listen' ? h('p', { class: 'pk-acc-desc' }, ACC_DESC) : null,
+      h('div', { class: 'pk-legend' },
+        item('is-right', '오른손'),
+        item('is-left', '왼손'),
+        hasVocal(song) ? item('is-vocal', '노래 멜로디') : null));
   }
 
   e.hint = h('div', { class: 'pk-hint' });
@@ -439,11 +495,13 @@ function buildReady(st) {
   const panel = h('div', { class: 'panel pk-panel pk-ready-panel' },
     h('div', { class: 'pk-ready-head' },
       h('span', { class: ['badge', 'pk-mode-badge', `is-${mode}`] }, MODE_LABEL[mode]),
+      isAccompaniment(song) ? h('span', { class: 'chip pk-acc-chip' }, '양손 반주') : null,
       mode !== 'listen' ? e.inputChip : null),
     h('h2', { class: 'pk-ready-title' }, song.title || '제목 없음'),
     song.artist ? h('div', { class: 'pk-ready-artist' }, song.artist) : null,
     h('div', { class: 'pk-ready-meta' }, meta.join(' · ')),
     e.desc,
+    accInfo,
     quick,
     e.hint,
     e.micErr,
@@ -484,14 +542,18 @@ function updateInputUi(st) {
     e.inputChip.textContent = INPUT_LABEL[st.inputMode] || INPUT_LABEL.mic;
     e.inputChip.dataset.input = st.inputMode;
   }
-  e.desc.textContent = usesInput ? `${MODE_DESC[st.mode]} ${INPUT_DESC[st.inputMode] || ''}`.trim() : MODE_DESC[st.mode];
+  const vocal = hasVocal(st.song);
+  const modeDesc = st.mode === 'listen' && vocal ? LISTEN_DESC_VOCAL : MODE_DESC[st.mode];
+  e.desc.textContent = usesInput ? `${modeDesc} ${INPUT_DESC[st.inputMode] || ''}`.trim() : modeDesc;
 
   const mic = usesInput && st.inputMode === 'mic';
   let text = '';
   if (mic && st.hasBacking) {
     text = '반주 음원이 함께 재생돼요. 반주 소리가 마이크로 들어가면 판정이 흔들리니 이어폰(헤드폰)을 사용해 주세요.';
   } else if (mic && st.settings.guideMelody && st.mode !== 'calibrate') {
-    text = '가이드 멜로디 소리가 마이크로 들어가면 잘못 판정될 수 있어요. 이어폰을 쓰거나 가이드를 꺼 주세요.';
+    text = vocal
+      ? '노래 멜로디 소리가 마이크로 들어가면 잘못 판정될 수 있어요. 이어폰을 쓰거나 멜로디 듣기를 꺼 주세요.'
+      : '가이드 멜로디 소리가 마이크로 들어가면 잘못 판정될 수 있어요. 이어폰을 쓰거나 가이드를 꺼 주세요.';
   }
   e.hint.replaceChildren(h('span', { class: 'pk-ico', html: ICON.headphones }), h('span', null, text));
   e.hint.hidden = !text;
@@ -1031,7 +1093,7 @@ function showListenFinish(st) {
   e.finishOv.replaceChildren(h('div', { class: 'panel pk-panel pk-finish-panel' },
     h('div', { class: 'pk-finish-icon', html: ICON.music }),
     h('h2', null, '감상 완료'),
-    h('p', { class: 'pk-finish-text' }, '멜로디를 익혔다면 이제 직접 연주해 볼까요?'),
+    h('p', { class: 'pk-finish-text' }, `${isAccompaniment(st.song) ? '반주를' : '멜로디를'} 익혔다면 이제 직접 연주해 볼까요?`),
     h('div', { class: 'pk-stack-actions' },
       h('button', {
         type: 'button', class: 'btn primary big',
@@ -1217,10 +1279,11 @@ function updateHud(st, snap) {
   if (holdKey !== hud.hold) {
     hud.hold = holdKey;
     if (holdKey && hn) {
-      const uniq = Array.from(new Set(hn.map((m) => Math.round(m)))).sort((a, b) => a - b);
-      const names = uniq.map((m) => displayName(st, m)).join(' · ');
-      const solfege = st.settings.labelStyle === 'solfege';
-      e.hold.replaceChildren(h('b', null, names), solfege ? ' 을 쳐주세요' : ' 건반을 쳐주세요');
+      const [names, suffix] = holdHintParts(hn, {
+        labelStyle: st.settings.labelStyle,
+        accompaniment: isAccompaniment(st.song),
+      });
+      e.hold.replaceChildren(h('b', null, names), suffix);
       e.hold.hidden = false;
     } else {
       e.hold.hidden = true;

@@ -12,7 +12,7 @@
 // never pairs one deploy's markup with another's scripts and never links old and new modules. The browser still
 // checks sw.js on every navigation, which is how a new deploy is found.
 
-const VERSION = '1.0.0+d76df55e';
+const VERSION = '1.0.0+1ad7fca9';
 const CACHE_PREFIX = 'piano-karaoke-';
 // Generic cache names of pre-release builds (e.g. a developer's localhost). Ours only when they hold this app's files.
 const LEGACY_CACHES = ['pk-v1', 'pk-v2'];
@@ -36,6 +36,7 @@ const PRECACHE = [
   'js/core/keyboard.js',
   'js/core/lyrics.js',
   'js/core/song.js',
+  'js/core/arrange.js',
   'js/core/midi.js',
   'js/core/notation.js',
   'js/core/musicxml.js',

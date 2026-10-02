@@ -1,6 +1,8 @@
 // Falling-notes highway + on-screen keyboard, drawn on a single 2D canvas.
 // Static parts (highway background/lanes, white keys, black keys) are pre-rendered into offscreen layers on resize;
 // each frame blits them and draws only the dynamic parts (grid, visible notes, tints, effects).
+// Two-hand songs: right-hand notes (h 'R' or untagged) are cyan / violet, left-hand notes (h 'L') amber / orange;
+// the sung melody (snapshot.vocal) is drawn as faint outlined bars behind the playable notes.
 
 import { fitRange, layoutKeys } from '../core/keyboard.js';
 import { noteName, pitchClass } from '../core/notes.js';
@@ -27,6 +29,12 @@ const MAX_BURSTS = 32;
 const EXPECTED = 1;
 const PRESSED = 2;
 const DETECTED = 4;
+const LEFT = 8; // the expected key belongs to the left hand
+
+const AUTO_GRADE = 4; // display-only notes in a judged run fade in a neutral colour (GRADE_COLOR[4])
+const VOCAL_STROKE = 'rgba(255,255,255,0.35)';
+const VOCAL_ACTIVE_STROKE = 'rgba(255,255,255,0.7)';
+const VOCAL_ACTIVE_FILL = 'rgba(255,255,255,0.08)';
 
 function clamp(x, lo, hi) {
   return x < lo ? lo : x > hi ? hi : x;
@@ -75,6 +83,11 @@ function lowerBound(notes, t) {
   return lo;
 }
 
+// fitRange over the playable notes and the sung melody.
+function songRange(notes, vocal) {
+  return fitRange(vocal.length ? notes.concat(vocal) : notes);
+}
+
 function makeLayer(prev, w, h) {
   const c = prev || document.createElement('canvas');
   if (c.width !== w) c.width = w;
@@ -83,11 +96,12 @@ function makeLayer(prev, w, h) {
 }
 
 export class HighwayRenderer {
-  constructor(canvas, { labelStyle = 'solfege', showDetected = true } = {}) {
+  constructor(canvas, { labelStyle = 'solfege', showDetected = true, showVocal = true } = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext('2d', { alpha: false }) || canvas.getContext('2d');
     this.labelStyle = labelStyle;
     this.showDetected = showDetected !== false;
+    this.showVocal = showVocal !== false;
 
     this.w = 0;
     this.h = 0;
@@ -112,7 +126,13 @@ export class HighwayRenderer {
     this.noteX = new Float32Array(0);
     this.noteW = new Float32Array(0);
     this.noteBlack = new Uint8Array(0);
+    this.noteLeft = new Uint8Array(0);
     this.labels = [];
+
+    this.vocal = [];
+    this.vocalMaxDur = 0;
+    this.vocalX = new Float32Array(0);
+    this.vocalW = new Float32Array(0);
 
     this._vis = new Int32Array(256);
     this._visYb = new Float32Array(256);
@@ -157,21 +177,23 @@ export class HighwayRenderer {
 
   setSong(song) {
     const notes = song && Array.isArray(song.notes) ? song.notes : [];
+    const vocal = song && Array.isArray(song.vocal) ? song.vocal : [];
     const bpm = Number(song && song.bpm);
     this.bpm = bpm >= 20 && bpm <= 400 ? bpm : 100;
     const bpb = Math.round(Number(song && song.beatsPerBar));
     this.beatsPerBar = bpb >= 1 && bpb <= 16 ? bpb : 4;
     const off = Number(song && song.offset);
     this.offset = Number.isFinite(off) ? off : 0;
-    const range = fitRange(notes);
+    const range = songRange(notes, vocal);
     this.lo = range.lo;
     this.hi = range.hi;
     this._setNotes(notes);
+    this._setVocal(vocal);
     if (this.w > 0 && this.h > 0) this._build();
     else this.resize();
   }
 
-  setOptions({ labelStyle, showDetected } = {}) {
+  setOptions({ labelStyle, showDetected, showVocal } = {}) {
     let rebuild = false;
     if (labelStyle && labelStyle !== this.labelStyle) {
       this.labelStyle = labelStyle;
@@ -179,6 +201,7 @@ export class HighwayRenderer {
       rebuild = true;
     }
     if (typeof showDetected === 'boolean') this.showDetected = showDetected;
+    if (typeof showVocal === 'boolean') this.showVocal = showVocal;
     if (rebuild && this.layout) this._build();
   }
 
@@ -240,6 +263,8 @@ export class HighwayRenderer {
     return key ? key.m : null;
   }
 
+  // A chord result (judge groupMode: `indices` lists its notes) gets one popup, at its top note, and a burst and
+  // key flash on every key of the chord.
   addJudgeEffect(result) {
     if (!result || !result.note || !this.layout) return;
     const key = this.layout.byMidi.get(Math.round(result.note.m));
@@ -248,6 +273,22 @@ export class HighwayRenderer {
     const now = performance.now();
     const cx = key.x + key.w / 2;
     this._lastEffect = now;
+    // Chord members are looked up in this.notes only when it is the array the result indexes.
+    if (Array.isArray(result.indices) && this.notes[result.index] === result.note) {
+      const seen = new Set([key.m]);
+      for (const i of result.indices) {
+        const n = this.notes[i];
+        const k = n ? this.layout.byMidi.get(Math.round(n.m)) : null;
+        if (!k || seen.has(k.m)) continue;
+        seen.add(k.m);
+        this._addBurst(k.x, k.w, gi, now);
+        if (gi !== 3) {
+          this._keyFlashT[k.m] = now;
+          this._keyFlashC[k.m] = gi;
+          this._spawnParticles(k.x + k.w / 2, this.hitY - 2, gi, gi === 0 ? 6 : 4, k.w * 0.6);
+        }
+      }
+    }
 
     // One popup per chord: skip when a same-grade popup was just spawned nearby.
     let dup = false;
@@ -284,6 +325,10 @@ export class HighwayRenderer {
       this._setNotes(snap.notes);
       this._layoutNotes();
     }
+    if (Array.isArray(snap.vocal) && snap.vocal !== this.vocal) {
+      this._setVocal(snap.vocal);
+      this._layoutVocal();
+    }
 
     const songTime = Number.isFinite(snap.songTime) ? snap.songTime : 0;
     const look = clamp(Number(lookahead) || 2.5, 0.5, 10);
@@ -296,6 +341,7 @@ export class HighwayRenderer {
     const flags = this._flags;
     flags.fill(0);
     if (snap.expectedKeys) for (const m of snap.expectedKeys) if (m >= 0 && m < 128) flags[m] |= EXPECTED;
+    if (snap.expectedLeft) for (const m of snap.expectedLeft) if (m >= 0 && m < 128) flags[m] |= LEFT;
     if (snap.pressedKeys) for (const m of snap.pressedKeys) if (m >= 0 && m < 128) flags[m] |= PRESSED;
     this._updateDetected(snap.detected, now);
     if (this._detM >= 0) flags[this._detM] |= DETECTED;
@@ -325,6 +371,7 @@ export class HighwayRenderer {
     this.noteX = new Float32Array(n);
     this.noteW = new Float32Array(n);
     this.noteBlack = new Uint8Array(n);
+    this.noteLeft = new Uint8Array(n);
     this.labels = new Array(n);
     const cache = new Map();
     let maxDur = 0;
@@ -332,6 +379,7 @@ export class HighwayRenderer {
       const note = this.notes[i];
       const d = note && note.d > 0 ? note.d : 0;
       if (d > maxDur) maxDur = d;
+      if (note && note.h === 'L') this.noteLeft[i] = 1;
       const m = Math.round(note ? note.m : 0);
       let label = cache.get(m);
       if (label === undefined) {
@@ -346,6 +394,36 @@ export class HighwayRenderer {
       this._vis = new Int32Array(cap);
       this._visYb = new Float32Array(cap);
       this._visYt = new Float32Array(cap);
+    }
+  }
+
+  _setVocal(vocal) {
+    this.vocal = Array.isArray(vocal) ? vocal : [];
+    const n = this.vocal.length;
+    this.vocalX = new Float32Array(n);
+    this.vocalW = new Float32Array(n);
+    let maxDur = 0;
+    for (const note of this.vocal) {
+      const d = note && note.d > 0 ? note.d : 0;
+      if (d > maxDur) maxDur = d;
+    }
+    this.vocalMaxDur = maxDur;
+  }
+
+  // Vocal guide bars span (almost) the whole lane, so they frame a playable note in the same lane.
+  _layoutVocal() {
+    if (!this.layout) return;
+    const byMidi = this.layout.byMidi;
+    for (let i = 0; i < this.vocal.length; i++) {
+      const note = this.vocal[i];
+      const key = note ? byMidi.get(Math.round(note.m)) : null;
+      if (!key) {
+        this.vocalW[i] = 0;
+        continue;
+      }
+      const inset = key.black ? 0.5 : 1;
+      this.vocalX[i] = key.x + inset;
+      this.vocalW[i] = Math.max(2, key.w - inset * 2);
     }
   }
 
@@ -389,26 +467,20 @@ export class HighwayRenderer {
     this.noteWW = Math.max(4, this.whiteW * 0.76);
     this.noteBW = Math.max(3, this.blackW * 0.9);
     this._layoutNotes();
+    this._layoutVocal();
 
     const hitY = this.hitY;
-    const gw = ctx.createLinearGradient(0, 0, this.noteWW, 0);
-    gw.addColorStop(0, '#0e7490');
-    gw.addColorStop(0.2, '#22d3ee');
-    gw.addColorStop(0.5, '#a5f3fc');
-    gw.addColorStop(0.8, '#22d3ee');
-    gw.addColorStop(1, '#0e7490');
-    this._gradWhiteNote = gw;
-    const gb = ctx.createLinearGradient(0, 0, this.noteBW, 0);
-    gb.addColorStop(0, '#5b21b6');
-    gb.addColorStop(0.2, '#8b5cf6');
-    gb.addColorStop(0.5, '#ddd6fe');
-    gb.addColorStop(0.8, '#8b5cf6');
-    gb.addColorStop(1, '#5b21b6');
-    this._gradBlackNote = gb;
+    // Right hand (and untagged notes): cyan on white keys, violet on black keys. Left hand: amber / orange.
+    this._gradWhiteNote = this._noteGradient(this.noteWW, '#0e7490', '#22d3ee', '#a5f3fc');
+    this._gradBlackNote = this._noteGradient(this.noteBW, '#5b21b6', '#8b5cf6', '#ddd6fe');
+    this._gradWhiteNoteL = this._noteGradient(this.noteWW, '#b45309', '#fbbf24', '#fef3c7');
+    this._gradBlackNoteL = this._noteGradient(this.noteBW, '#9a3412', '#f97316', '#fed7aa');
 
     this._glowH = Math.min(hitY, Math.max(80, hitY * 0.32));
     this._laneCyan = this._verticalGlow(hitY - this._glowH, hitY, '34,211,238', 0.3);
     this._laneViolet = this._verticalGlow(hitY - this._glowH, hitY, '167,139,250', 0.38);
+    this._laneAmber = this._verticalGlow(hitY - this._glowH, hitY, '251,191,36', 0.3);
+    this._laneOrange = this._verticalGlow(hitY - this._glowH, hitY, '249,115,22', 0.38);
     this._lanePressed = this._verticalGlow(hitY - this._glowH * 0.7, hitY, '124,92,255', 0.22);
     this._burstH = Math.min(hitY, 150);
     this._burstGrad = GRADE_RGB.map((rgb) => this._verticalGlow(hitY - this._burstH, hitY, rgb, 0.55));
@@ -434,6 +506,17 @@ export class HighwayRenderer {
     this._fontSub = `700 ${Math.round(this._popSize * 0.55)}px ${FONT}`;
 
     this._buildLayers();
+  }
+
+  // Horizontal note gradient: dark edges, base colour, light centre.
+  _noteGradient(w, edge, base, light) {
+    const g = this.ctx.createLinearGradient(0, 0, w, 0);
+    g.addColorStop(0, edge);
+    g.addColorStop(0.2, base);
+    g.addColorStop(0.5, light);
+    g.addColorStop(0.8, base);
+    g.addColorStop(1, edge);
+    return g;
   }
 
   _verticalGlow(y0, y1, rgb, alpha) {
@@ -615,7 +698,8 @@ export class HighwayRenderer {
       if (!(f & (EXPECTED | PRESSED))) continue;
       if (f & EXPECTED) {
         ctx.globalAlpha = holding ? 0.55 + 0.45 * pulse : 1;
-        ctx.fillStyle = k.black ? this._laneViolet : this._laneCyan;
+        if (f & LEFT) ctx.fillStyle = k.black ? this._laneOrange : this._laneAmber;
+        else ctx.fillStyle = k.black ? this._laneViolet : this._laneCyan;
         ctx.fillRect(k.x, top, k.w, this._glowH);
       } else {
         ctx.globalAlpha = 1;
@@ -652,16 +736,49 @@ export class HighwayRenderer {
     }
   }
 
+  // The sung melody: outlined bars in their lanes, behind the playable notes; the note being sung is brighter.
+  _drawVocal(songTime, tEnd, pps) {
+    const vocal = this.vocal;
+    if (!this.showVocal || !vocal.length) return;
+    const ctx = this.ctx;
+    const hitY = this.hitY;
+    ctx.lineWidth = 2;
+    for (let i = lowerBound(vocal, songTime - this.vocalMaxDur - 0.05); i < vocal.length; i++) {
+      const note = vocal[i];
+      const t = note.t;
+      if (t > tEnd) break;
+      const w = this.vocalW[i];
+      if (!(w > 0)) continue;
+      const end = t + note.d;
+      if (end < songTime - 0.01) continue;
+      const yb = hitY - (t - songTime) * pps;
+      let yt = hitY - (end - songTime) * pps;
+      if (yb - yt < 10) yt = yb - 10;
+      const x = this.vocalX[i];
+      const r = Math.min(6, w * 0.25);
+      const active = songTime >= t && songTime < end;
+      roundRectPath(ctx, x + 1, yt + 1, w - 2, yb - yt - 2, r);
+      if (active) {
+        ctx.fillStyle = VOCAL_ACTIVE_FILL;
+        ctx.fill();
+      }
+      ctx.strokeStyle = active ? VOCAL_ACTIVE_STROKE : VOCAL_STROKE;
+      ctx.stroke();
+    }
+  }
+
   _drawNotes(snap, songTime, look, pps, speed) {
     const notes = this.notes;
     const n = notes.length;
-    if (!n) return;
+    if (!n && !(this.showVocal && this.vocal.length)) return;
     const ctx = this.ctx;
     const dpr = this.dpr;
     const W = this.w;
     const hitY = this.hitY;
     const states = snap.states;
     const judgedAt = snap.judgedAt;
+    // Display-only notes of a judged run fade neutrally; listen mode keeps its own look.
+    const autoGrade = snap.mode === 'listen' ? GRADE_INDEX.auto : AUTO_GRADE;
     const tEnd = songTime + look + 0.05;
     const vis = this._vis;
     const visYb = this._visYb;
@@ -672,6 +789,7 @@ export class HighwayRenderer {
     ctx.beginPath();
     ctx.rect(0, 0, W, hitY);
     ctx.clip();
+    this._drawVocal(songTime, tEnd, pps);
     ctx.lineWidth = 1;
 
     for (let i = lowerBound(notes, songTime - this.maxDur - 0.05); i < n; i++) {
@@ -689,15 +807,18 @@ export class HighwayRenderer {
       const hgt = yb - yt;
       const x = this.noteX[i];
       const black = this.noteBlack[i] === 1;
+      const left = this.noteLeft[i] === 1;
       const r = Math.min(7, w * 0.3);
       const st = states ? states[i] : 'pending';
 
       if (st === undefined || st === null || st === 'pending') {
         ctx.setTransform(dpr, 0, 0, dpr, dpr * x, 0);
-        ctx.fillStyle = black ? this._gradBlackNote : this._gradWhiteNote;
+        if (left) ctx.fillStyle = black ? this._gradBlackNoteL : this._gradWhiteNoteL;
+        else ctx.fillStyle = black ? this._gradBlackNote : this._gradWhiteNote;
         roundRectPath(ctx, 0, yt, w, hgt, r);
         ctx.fill();
-        ctx.strokeStyle = black ? 'rgba(237,233,254,0.55)' : 'rgba(207,250,254,0.6)';
+        if (left) ctx.strokeStyle = black ? 'rgba(255,237,213,0.55)' : 'rgba(254,243,199,0.6)';
+        else ctx.strokeStyle = black ? 'rgba(237,233,254,0.55)' : 'rgba(207,250,254,0.6)';
         ctx.stroke();
         ctx.fillStyle = 'rgba(255,255,255,0.85)';
         ctx.fillRect(3, yb - 4.5, w - 6, 2.5);
@@ -715,20 +836,22 @@ export class HighwayRenderer {
         ctx.strokeStyle = 'rgba(248,113,113,0.45)';
         ctx.stroke();
       } else {
-        const gi = GRADE_INDEX[st] ?? 0;
+        const auto = st === 'auto';
+        const gi = auto ? autoGrade : GRADE_INDEX[st] ?? 0;
+        const dim = auto && gi === AUTO_GRADE ? 0.5 : 1;
         let jt = judgedAt ? judgedAt[i] : NaN;
         if (!Number.isFinite(jt)) jt = t;
         const age = Math.max(0, (songTime - jt) / speed);
         ctx.setTransform(dpr, 0, 0, dpr, dpr * x, 0);
         if (note.d >= SUSTAIN_MIN && yt < hitY - 2) {
           // Held tail keeps glowing until it slides into the keyboard.
-          ctx.globalAlpha = 0.3;
+          ctx.globalAlpha = 0.3 * dim;
           ctx.fillStyle = GRADE_COLOR[gi];
           roundRectPath(ctx, 0, yt, w, Math.min(yb, hitY + r) - yt, r);
           ctx.fill();
         }
         if (age < FLASH_SEC) {
-          const a = 1 - age / FLASH_SEC;
+          const a = (1 - age / FLASH_SEC) * dim;
           ctx.fillStyle = GRADE_COLOR[gi];
           ctx.globalAlpha = a * 0.3;
           roundRectPath(ctx, -5, yt - 5, w + 10, hgt + 10, r + 5);
@@ -746,7 +869,7 @@ export class HighwayRenderer {
     }
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    // Labels: one pass per font to avoid font switching per note.
+    // Labels: one pass per font to avoid font switching per note (left-hand white notes use a dark brown).
     if (vc > 0 && this.labelStyle !== 'none') {
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
@@ -754,10 +877,15 @@ export class HighwayRenderer {
         const black = pass === 1;
         const size = black ? this._labelB : this._labelW;
         ctx.font = black ? this._fontNoteB : this._fontNoteW;
-        ctx.fillStyle = black ? '#ffffff' : '#053340';
+        let shade = -1;
         for (let k = 0; k < vc; k++) {
           const i = vis[k];
           if ((this.noteBlack[i] === 1) !== black) continue;
+          const left = !black && this.noteLeft[i] === 1 ? 1 : 0;
+          if (left !== shade) {
+            shade = left;
+            ctx.fillStyle = black ? '#ffffff' : left ? '#451a03' : '#053340';
+          }
           const label = this.labels[i];
           if (!label) continue;
           const yt = visYt[k];
@@ -797,7 +925,7 @@ export class HighwayRenderer {
       }
       if (f & EXPECTED) {
         ctx.globalAlpha = holding ? 0.3 + 0.3 * pulse : 0.34;
-        ctx.fillStyle = '#22d3ee';
+        ctx.fillStyle = f & LEFT ? '#fbbf24' : '#22d3ee';
         ctx.fillRect(x, whiteTop, w, whiteH);
         ctx.globalAlpha = 0.95;
         ctx.fillRect(x, whiteTop, w, 4);
@@ -834,11 +962,12 @@ export class HighwayRenderer {
         ctx.fillRect(x, blackTop, w, blackH);
       }
       if (f & EXPECTED) {
+        const left = (f & LEFT) !== 0;
         ctx.globalAlpha = holding ? 0.45 + 0.35 * pulse : 0.6;
-        ctx.fillStyle = '#a78bfa';
+        ctx.fillStyle = left ? '#f97316' : '#a78bfa';
         ctx.fillRect(x, blackTop, w, blackH);
         ctx.globalAlpha = 1;
-        ctx.fillStyle = '#ddd6fe';
+        ctx.fillStyle = left ? '#fed7aa' : '#ddd6fe';
         ctx.fillRect(x, blackTop, w, 3);
       }
       if (f & DETECTED) {

@@ -8,7 +8,7 @@ import {
 import { toast, closeTopModal, isModalOpen, isPickingFile, onModalChange } from './ui/dom.js';
 
 // Build stamp ('<package version>+<content hash>'), written by tools/stamp-version.mjs together with sw.js VERSION.
-export const APP_VERSION = '1.0.0+d76df55e';
+export const APP_VERSION = '1.0.0+1ad7fca9';
 
 const SCREENS = ['home', 'play', 'results', 'settings', 'calibrate', 'editor'];
 const TRANSIENT = new Set(['play', 'results']);

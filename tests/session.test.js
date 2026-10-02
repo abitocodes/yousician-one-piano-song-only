@@ -555,6 +555,315 @@ test('resume just before a crossing: its guide note and beat play at once instea
   s.destroy();
 });
 
+// ------------------------------------------------------------------ two-hand accompaniment + sung melody
+
+// Original made-up material: C / F / G chords with bass notes and a placeholder melody line.
+const H = (t, m, h, d = 0.3) => ({ t, d, m, h });
+const ACC = [
+  H(1, 36, 'L'), H(1, 48, 'L'), H(1, 60, 'R'), H(1, 64, 'R'), H(1, 67, 'R'),
+  H(1.5, 33, 'L'),
+  H(2, 41, 'L'), H(2, 65, 'R'), H(2, 69, 'R'),
+  H(3, 43, 'L'), H(3, 67, 'R'), H(3, 71, 'R'),
+];
+const VOCAL = [N(1, 72, 0.4), N(1.5, 74, 0.4), N(2, 76, 0.8), N(3, 79, 0.8)];
+const accSong = (extra = {}) => ({ title: 't', bpm: 120, notes: ACC, vocal: VOCAL, arrangement: 'accompaniment', ...extra });
+
+test('accompaniment: chords are judged per group, low notes are display-only, snapshot carries the vocal', () => {
+  freshCtx();
+  const song = accSong();
+  const s = new GameSession({ song, settings: { inputMode: 'touch' }, mode: 'play' });
+  assert.equal(s.judge.groupMode, true);
+  assert.equal(s.judge.floor, 41);
+  assert.equal(s.stats.total, 3, 'three chords; the lone low A1 is no group');
+  assert.equal(s.vocal, VOCAL, 'the song\'s own sorted vocal array');
+  assert.equal(s.arrangement, 'accompaniment');
+  let finished = null;
+  s.on('finish', (st) => { finished = st; });
+  const events = [];
+  s.on('judge', (r) => events.push(r));
+  s.start();
+  const first = s.tick();
+  assert.equal(first.vocal, VOCAL);
+  assert.equal(first.arrangement, 'accompaniment');
+  const lead = -s.startSongTime;
+  const d = new Driver(s);
+  // One key per chord: the right hand's top, then the left hand's bass F2 (= the floor), then a middle note.
+  d.at(1 + lead, () => { s.touchDown(67); s.touchUp(67); });
+  d.at(2 + lead, () => { s.touchDown(41); s.touchUp(41); });
+  d.at(3 + lead, () => { s.touchDown(67); s.touchUp(67); });
+  d.runTo(1 + lead + 0.05);
+  assert.equal(s.judge.stateOf(0), 'auto', 'C2 below the floor');
+  assert.equal(s.judge.stateOf(1), 'perfect', 'C3 is part of the chord');
+  const snap = d.runTo(6 + lead);
+  assert.ok(finished);
+  assert.deepEqual(finished.counts, { perfect: 3, great: 0, good: 0, miss: 0 });
+  assert.equal(finished.score, 1000000);
+  assert.equal(finished.stray, 0);
+  assert.equal(events.length, 3, 'one judge event per chord');
+  assert.deepEqual(events[0].indices, [1, 2, 3, 4], 'the judgeable notes of the chord');
+  assert.equal(snap.states[5], 'auto');
+  close(s.duration, 3.8, 1e-9, 'duration includes the sung melody');
+  s.destroy();
+
+  freshCtx();
+  const plain = new GameSession({ song: { title: 't', notes: [N(1, 60)] }, settings: { inputMode: 'touch' } });
+  assert.equal(plain.judge.groupMode, false);
+  const ps = plain.tick();
+  assert.deepEqual(ps.vocal, []);
+  assert.equal(ps.arrangement, 'melody');
+  plain.destroy();
+});
+
+test('accompaniment: expected keys carry the hand (left-hand keys in their own set)', () => {
+  freshCtx();
+  const s = new GameSession({ song: accSong(), settings: { inputMode: 'touch' }, mode: 'play' });
+  s.start();
+  const lead = -s.startSongTime;
+  const snap = new Driver(s).runTo(1 + lead - 0.05);
+  assert.deepEqual([...snap.expectedKeys].sort((a, b) => a - b), [36, 48, 60, 64, 67]);
+  assert.deepEqual([...snap.expectedLeft].sort((a, b) => a - b), [36, 48]);
+  s.destroy();
+});
+
+test('accompaniment guide: play mode plays the sung melody, not the chords', () => {
+  freshCtx();
+  const s = new GameSession({ song: accSong(), settings: { inputMode: 'touch', guideMelody: true }, mode: 'play' });
+  s.start();
+  new Driver(s).runTo(8);
+  const synth = env.synths[0];
+  assert.deepEqual(synth.notes.map((x) => x.midi), VOCAL.map((n) => n.m));
+  for (const x of synth.notes) {
+    assert.equal(x.opts.velocity, 0.9);
+    assert.equal(x.opts.destination, undefined);
+  }
+  s.destroy();
+
+  // Without the guide setting nothing is played.
+  freshCtx();
+  const quiet = new GameSession({ song: accSong(), settings: { inputMode: 'touch' }, mode: 'play' });
+  quiet.start();
+  new Driver(quiet).runTo(8);
+  assert.equal(env.synths[0].notes.length, 0);
+  quiet.destroy();
+});
+
+test('accompaniment listen: plays the accompaniment softly and the sung melody on top', () => {
+  freshCtx();
+  const s = new GameSession({ song: accSong(), settings: { inputMode: 'touch' }, mode: 'listen' });
+  s.start();
+  const lead = -s.startSongTime;
+  const snap = new Driver(s).runTo(8);
+  const synth = env.synths[0];
+  const acc = synth.notes.filter((x) => x.opts.velocity === 0.6);
+  const voc = synth.notes.filter((x) => x.opts.velocity === 0.9);
+  assert.equal(acc.length, ACC.length);
+  assert.deepEqual(voc.map((x) => x.midi), VOCAL.map((n) => n.m));
+  assert.equal(synth.notes.length, ACC.length + VOCAL.length);
+  close(voc[2].when, 2 + lead, 1e-9, 'on the beat');
+  assert.ok(snap.states.every((x) => x === 'auto'));
+  s.destroy();
+});
+
+test('accompaniment practice: holds wait for the group, any note releases it, low notes never hold', () => {
+  freshCtx();
+  const s = new GameSession({ song: accSong(), settings: { inputMode: 'touch' }, mode: 'practice' });
+  s.start();
+  const lead = -s.startSongTime;
+  const d = new Driver(s);
+  let holds = 0;
+  s.on('state', (st) => { if (st === 'holding') holds++; });
+  let snap = d.runTo(1 + lead + 0.05);
+  assert.equal(s.state, 'holding');
+  assert.deepEqual(snap.holdingNotes, [48, 60, 64, 67], 'the judgeable notes of the group');
+  d.at(1 + lead + 0.1, () => { s.touchDown(48); s.touchUp(48); });
+  d.runTo(1 + lead + 0.15);
+  assert.equal(s.state, 'playing', 'one note of the chord releases the hold');
+  assert.deepEqual(s.judge.states.slice(0, 5), ['auto', 'good', 'good', 'good', 'good']);
+  // The low A1 at 1.5 passes without a hold.
+  snap = d.runTo(1 + lead + 0.1 + 0.6);
+  assert.equal(s.state, 'playing');
+  assert.equal(snap.states[5], 'auto');
+  d.runTo(2 + lead + 0.2);
+  assert.equal(s.state, 'holding');
+  d.at(2 + lead + 0.3, () => { s.touchDown(69); s.touchUp(69); });
+  d.runTo(3 + lead + 0.6);
+  assert.equal(s.state, 'holding');
+  d.at(3 + lead + 0.7, () => { s.touchDown(43); s.touchUp(43); });
+  let finished = null;
+  s.on('finish', (st) => { finished = st; });
+  d.runTo(10);
+  assert.equal(holds, 3);
+  assert.ok(finished);
+  assert.deepEqual(finished.counts, { perfect: 0, great: 0, good: 3, miss: 0 });
+  s.destroy();
+});
+
+test('accompaniment practice + guide: the sung melody is scheduled (cut at holds), no chord hint', (t) => {
+  let perf = 0;
+  t.mock.method(performance, 'now', () => perf);
+  freshCtx();
+  const s = new GameSession({ song: accSong(), settings: { inputMode: 'touch', guideMelody: true }, mode: 'practice' });
+  s.start();
+  const lead = -s.startSongTime;
+  const d = new Driver(s);
+  d.runTo(1 + lead + 0.05);
+  assert.equal(s.state, 'holding');
+  perf += 5000;
+  d.runTo(1 + lead + 1);
+  const synth = env.synths[0];
+  assert.deepEqual(synth.notes.map((x) => x.midi), [72], 'the melody note at the hold; no chord hint, later notes cut');
+  assert.ok(synth.notes.every((x) => x.opts.velocity === 0.9));
+  d.at(1 + lead + 1.1, () => { s.touchDown(60); s.touchUp(60); });
+  d.runTo(1 + lead + 1.1 + 1.2);
+  assert.deepEqual(synth.notes.filter((x) => !x.h.stopped).map((x) => x.midi), [72, 74, 76]);
+  s.destroy();
+});
+
+test('accompaniment practice + mic + guide: the sung note at the hold does not release it through the mic', () => {
+  freshCtx();
+  const input = new FakeInput('mic');
+  const s = new GameSession({
+    song: accSong(),
+    settings: { inputMode: 'mic', latency: 0.12, guideMelody: true },
+    mode: 'practice',
+    input,
+  });
+  s.start();
+  const cross = 1 - s.startSongTime;
+  const d = new Driver(s, input);
+  const judged = [];
+  s.on('judge', (r) => judged.push(r.grade));
+  // The speaker plays the sung C5 as the C major chord reaches the line; the mic hears it (a chord tone).
+  d.runTo(cross + 0.05);
+  assert.equal(s.state, 'holding');
+  assert.ok(env.synths[0].notes.some((x) => x.midi === 72 && !x.h.stopped), 'the melody note at the hold sounds');
+  d.strike(cross, 72);
+  d.runTo(cross + 0.5);
+  assert.equal(s.state, 'holding', 'the melody\'s own sound does not release the hold');
+  assert.deepEqual(judged, []);
+  assert.equal(s.stats.stray, 0);
+  // Once the melody note has sounded (+ latency) the same pitch class from the player releases it.
+  d.strike(cross + 0.6, 60);
+  d.runTo(cross + 0.9);
+  assert.equal(s.state, 'playing');
+  assert.deepEqual(judged, ['good']);
+  s.destroy();
+
+  // Without the guide nothing is guarded: the same detection releases the hold (it is the player's strike).
+  freshCtx();
+  const input2 = new FakeInput('mic');
+  const q = new GameSession({ song: accSong(), settings: { inputMode: 'mic', latency: 0.12 }, mode: 'practice', input: input2 });
+  q.start();
+  const d2 = new Driver(q, input2);
+  d2.strike(cross, 72);
+  d2.runTo(cross + 0.5);
+  assert.equal(q.state, 'playing');
+  assert.equal(q.judge.stateOf(1), 'perfect');
+  q.destroy();
+});
+
+test('accompaniment practice + touch: the other fingers of a held chord do not take the next chord', () => {
+  freshCtx();
+  const notes = [];
+  const ts = [1, 1.25, 1.5, 1.75];
+  for (const t of ts) notes.push(H(t, 60, 'R'), H(t, 64, 'R'), H(t, 67, 'R'));
+  const s = new GameSession({
+    song: { title: 't', bpm: 120, notes, arrangement: 'accompaniment' }, settings: { inputMode: 'touch' }, mode: 'practice',
+  });
+  s.start();
+  const d = new Driver(s);
+  let holds = 0;
+  const tap = (m) => { s.touchDown(m); s.touchUp(m); };
+  // Each time the song waits, three fingers land 0 / 40 / 60 ms apart.
+  s.on('state', (st) => {
+    if (st !== 'holding') return;
+    holds++;
+    const at = env.ctx.currentTime + 0.05;
+    d.at(at, () => tap(60));
+    d.at(at + 0.04, () => tap(64));
+    d.at(at + 0.06, () => tap(67));
+  });
+  let finished = null;
+  s.on('finish', (st) => { finished = st; });
+  d.runTo(12);
+  assert.equal(holds, 4, 'every chord is held once');
+  assert.ok(finished);
+  assert.deepEqual(finished.counts, { perfect: 0, great: 0, good: 4, miss: 0 });
+  assert.equal(finished.stray, 0);
+  s.destroy();
+});
+
+test('accompaniment play + mic: the left hand 80 ms after the right hand stays with its chord', () => {
+  freshCtx();
+  const notes = [];
+  const ts = [1, 1.25, 1.5, 1.75];
+  for (const t of ts) notes.push(H(t, 48, 'L'), H(t, 60, 'R'), H(t, 64, 'R'), H(t, 67, 'R'));
+  const input = new FakeInput('mic');
+  const s = new GameSession({
+    song: { title: 't', bpm: 120, notes, arrangement: 'accompaniment' },
+    settings: { inputMode: 'mic', latency: 0.12 },
+    mode: 'play',
+    input,
+  });
+  s.start();
+  const lead = -s.startSongTime;
+  const d = new Driver(s, input);
+  for (const t of ts) {
+    for (const m of [60, 64, 67]) d.strike(t + lead, m);
+    d.strike(t + lead + 0.08, 48);
+  }
+  let finished = null;
+  s.on('finish', (st) => { finished = st; });
+  d.runTo(ts[3] + lead + 3);
+  assert.ok(finished);
+  assert.deepEqual(finished.counts, { perfect: 4, great: 0, good: 0, miss: 0 });
+  assert.equal(finished.stray, 0);
+  assert.equal(finished.score, 1000000);
+  s.destroy();
+});
+
+test('accompaniment + simulated input: every note feeds the detector, the melody only the speakers', () => {
+  freshCtx();
+  const input = new FakeInput('sim');
+  const s = new GameSession({
+    song: accSong(),
+    settings: { inputMode: 'sim', guideMelody: true },
+    mode: 'play',
+    input,
+  });
+  s.start();
+  new Driver(s, input).runTo(8);
+  const synth = env.synths[0];
+  const fed = synth.notes.filter((x) => Array.isArray(x.opts.destination));
+  assert.equal(fed.length, ACC.length);
+  for (const x of fed) assert.deepEqual(x.opts.destination, [synth.output, input.simInput]);
+  const sung = synth.notes.filter((x) => !Array.isArray(x.opts.destination));
+  assert.deepEqual(sung.map((x) => x.midi), VOCAL.map((n) => n.m));
+  s.destroy();
+});
+
+test('accompaniment: a melody pickup before the first chord gets the lead-in', () => {
+  freshCtx();
+  const s = new GameSession({
+    song: { title: 't', notes: [H(10, 60, 'R'), H(10, 48, 'L')], vocal: [N(6, 72)], arrangement: 'accompaniment' },
+    settings: { inputMode: 'touch' },
+  });
+  assert.equal(s.startSongTime, 6 - 3.5);
+  assert.equal(s.firstNoteT, 10, 'the count-in still counts to the first chord');
+  s.destroy();
+});
+
+test('dedupe keeps the hand tag: a right-hand copy wins over a left-hand one', () => {
+  freshCtx();
+  const notes = [H(1, 60, 'L', 0.5), H(1, 60, 'R', 0.2), H(2, 55, 'L', 0.2), H(2.01, 55, 'L', 0.4), H(3, 50, 'R'), H(3, 50, 'L')];
+  const before = JSON.stringify(notes);
+  const s = new GameSession({ song: { title: 't', notes }, settings: { inputMode: 'touch' } });
+  assert.equal(JSON.stringify(notes), before, 'song notes are not mutated');
+  assert.deepEqual(s.notes.map((n) => [n.t, n.m, n.d, n.h]), [[1, 60, 0.5, 'R'], [2, 55, 0.4, 'L'], [3, 50, 0.3, 'R']]);
+  assert.equal(s.notes[2], notes[4], 'an unchanged kept note is the song\'s own object');
+  s.destroy();
+});
+
 test('simulated input is not shifted (it reaches the detector without output delay)', () => {
   const input = new FakeInput('sim');
   const { synth, lead, notes } = scheduledTimes(

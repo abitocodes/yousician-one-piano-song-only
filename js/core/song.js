@@ -31,7 +31,10 @@ function byTimeThenPitch(a, b) {
   return a.t - b.t || a.m - b.m;
 }
 
-function normalizeNote(n) {
+const HANDS = new Set(['R', 'L']);
+const ARRANGEMENTS = new Set(['melody', 'accompaniment']);
+
+function normalizeNote(n, keepHand = true) {
   if (!isObj(n)) return null;
   const t = num(n.t);
   const m = num(n.m);
@@ -43,7 +46,18 @@ function normalizeNote(n) {
   const note = { t: r3(t), d: Math.max(0.001, r3(d)), m: mi };
   const v = num(n.v);
   if (Number.isFinite(v)) note.v = r3(clamp(v, 0, 1));
+  if (keepHand && HANDS.has(n.h)) note.h = n.h;
   return note;
+}
+
+function normalizeNoteList(list, keepHand) {
+  const out = [];
+  for (const n of Array.isArray(list) ? list : []) {
+    const note = normalizeNote(n, keepHand);
+    if (note) out.push(note);
+  }
+  out.sort(byTimeThenPitch);
+  return out;
 }
 
 function normalizeLines(lines) {
@@ -93,12 +107,9 @@ export function normalizeSong(raw) {
   if (!isObj(raw) || !Array.isArray(raw.notes)) throw new Error(ERR_FORMAT);
   if (raw.format !== undefined && raw.format !== SONG_FORMAT) throw new Error(ERR_FORMAT);
 
-  const notes = [];
-  for (const n of raw.notes) {
-    const note = normalizeNote(n);
-    if (note) notes.push(note);
-  }
-  notes.sort(byTimeThenPitch);
+  const notes = normalizeNoteList(raw.notes, true);
+  // Sung melody (accompaniment songs): not played or judged; times lyrics and the guide melody.
+  const vocal = normalizeNoteList(raw.vocal, false);
 
   const bpm = num(raw.bpm);
   const bpb = num(raw.beatsPerBar);
@@ -118,6 +129,8 @@ export function normalizeSong(raw) {
     beatsPerBar: Number.isFinite(bpb) && bpb >= 1 ? clamp(Math.round(bpb), 1, 16) : 4,
     offset: Number.isFinite(offset) ? r3(offset) : 0,
     notes,
+    vocal,
+    arrangement: ARRANGEMENTS.has(raw.arrangement) ? raw.arrangement : 'melody',
     lyrics: normalizeLyrics(raw.lyrics),
     audio: normalizeAudio(raw.audio),
     createdAt: Number.isFinite(createdAt) && createdAt >= 0 ? createdAt : now,
@@ -127,10 +140,18 @@ export function normalizeSong(raw) {
   if (typeof raw.template === 'boolean') song.template = raw.template;
   // Hand-written/imported files may carry lyric text without computed timing.
   const ly = song.lyrics;
-  if (ly.source === 'notes' && !ly.lines.length && ly.text.trim() && notes.length) {
-    ly.lines = assignLyrics(ly.text, notes).lines;
+  const timing = lyricTimingNotes(song);
+  if (ly.source === 'notes' && !ly.lines.length && ly.text.trim() && timing.length) {
+    ly.lines = assignLyrics(ly.text, timing).lines;
   }
   return song;
+}
+
+/** Notes that lyric syllables are timed against: the sung melody when present, else the played notes. */
+export function lyricTimingNotes(song) {
+  if (!song) return [];
+  if (Array.isArray(song.vocal) && song.vocal.length) return song.vocal;
+  return Array.isArray(song.notes) ? song.notes : [];
 }
 
 export function createSong(partial = {}) {
@@ -152,9 +173,11 @@ export function createSong(partial = {}) {
 export function songDuration(song) {
   let end = 0;
   if (!song) return 0;
-  for (const n of Array.isArray(song.notes) ? song.notes : []) {
-    const e = n.t + n.d;
-    if (Number.isFinite(e) && e > end) end = e;
+  for (const list of [song.notes, song.vocal]) {
+    for (const n of Array.isArray(list) ? list : []) {
+      const e = n.t + n.d;
+      if (Number.isFinite(e) && e > end) end = e;
+    }
   }
   const lines = song.lyrics && Array.isArray(song.lyrics.lines) ? song.lyrics.lines : [];
   for (const line of lines) {
@@ -204,7 +227,8 @@ export function shiftNotes(notes, sec) {
 }
 
 // Snaps starts and ends to a grid of (60/bpm)/division seconds anchored at `offset`; min length one grid step.
-// Notes of the same pitch that collapse onto the same start are merged (the longer one wins).
+// Notes of the same pitch that collapse onto the same start are merged (the longer one wins; a right-hand
+// tag wins over a left-hand one). Other note fields (v, h, …) are kept.
 export function quantizeNotes(notes, bpm, offset, division) {
   const tempo = Number.isFinite(bpm) && bpm > 0 ? bpm : DEFAULT_BPM;
   const off = Number.isFinite(offset) ? offset : 0;
@@ -221,6 +245,7 @@ export function quantizeNotes(notes, bpm, offset, division) {
     const prev = seen.get(key);
     if (prev) {
       if (q.d > prev.d) prev.d = q.d;
+      if (q.h === 'R' && prev.h === 'L') prev.h = 'R';
       continue;
     }
     seen.set(key, q);

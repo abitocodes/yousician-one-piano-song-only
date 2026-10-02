@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Judge, WINDOWS, GRADE_FACTOR, rankFor, GROUP_EPS } from '../js/game/judge.js';
+import { Judge, WINDOWS, GRADE_FACTOR, rankFor, GROUP_EPS, CHORD_SPREAD } from '../js/game/judge.js';
 
 const close = (a, b, eps = 1e-9) => assert.ok(Math.abs(a - b) <= eps, `expected ${a} ≈ ${b}`);
 const N = (t, m, d = 0.4) => ({ t, d, m });
@@ -608,4 +608,328 @@ test('states array is a live reference', () => {
   const states = j.states;
   j.input({ time: 1, midi: 60 });
   assert.equal(states[0], 'perfect');
+});
+
+// ------------------------------------------------------------------ groupMode (two-hand accompaniment)
+
+// Original made-up material: simple triads and bass notes.
+const G = (opts = {}) => ({ groupMode: true, floor: 41, ...opts });
+
+test('groupMode: a chord is hit as a whole by any one of its notes, one event per group', () => {
+  // C major triad at 1 (+ a bass C3 a few ms later), then D minor at 2.
+  const notes = [N(1, 60), N(1, 64), N(1, 67), N(1.01, 48), N(2, 62), N(2, 65), N(2, 69)];
+  const j = new Judge(notes, G());
+  const events = [];
+  j.on('judge', (r) => events.push(r));
+  assert.equal(j.stats.total, 2, 'total = judgeable groups');
+  const r = j.input({ time: 1.01, midi: 64 });
+  assert.ok(r);
+  assert.equal(r.index, 2, 'index = top note of the group');
+  assert.equal(r.note, notes[2]);
+  assert.deepEqual(r.indices, [0, 1, 2, 3], 'every note of the group, in time order');
+  assert.equal(r.grade, 'perfect');
+  close(r.delta, 0.01);
+  assert.deepEqual(j.states.slice(0, 4), ['perfect', 'perfect', 'perfect', 'perfect']);
+  for (const i of [0, 1, 2, 3]) assert.equal(j.judgedAt[i], 1.01);
+  assert.equal(events.length, 1, 'one judge event for the whole chord');
+  // The other detections of the same strike neither hit again nor count as strays.
+  assert.equal(j.input({ time: 1.01, midi: 60 }), null);
+  assert.equal(j.input({ time: 1.01, midi: 67 }), null);
+  let s = j.stats;
+  assert.equal(s.stray, 0);
+  assert.deepEqual(s.counts, { perfect: 1, great: 0, good: 0, miss: 0 });
+  assert.equal(s.judged, 1);
+  assert.equal(s.combo, 1);
+  assert.equal(s.score, 500000);
+  assert.equal(s.deltas.length, 1);
+  // Second chord, hit by its bottom note 100 ms late.
+  const r2 = j.input({ time: 2.1, midi: 62 });
+  assert.equal(r2.index, 6);
+  assert.deepEqual(r2.indices, [4, 5, 6]);
+  assert.equal(r2.grade, 'great');
+  s = j.stats;
+  assert.equal(s.combo, 2);
+  assert.equal(s.maxCombo, 2);
+  assert.equal(s.score, Math.round(1.7 * 500000));
+  close(s.accuracy, 0.85);
+  assert.equal(j.firstPending(), -1);
+  assert.equal(events.length, 2);
+});
+
+test('groupMode: wrong pitches are strays; octave tolerance and detector strikes match by pitch class', () => {
+  const chord = () => [N(1, 60), N(1, 64), N(1, 67)];
+  const j = new Judge(chord(), G());
+  assert.equal(j.input({ time: 1, midi: 62 }), null);
+  assert.equal(j.stats.stray, 1);
+  assert.equal(j.input({ time: 1.3, midi: 76 }), null, 'outside the window');
+  assert.equal(j.input({ time: 1.05, midi: 76 }).grade, 'perfect', 'E5 hits the chord with E4 (octave tolerant)');
+
+  const strict = new Judge(chord(), G({ octaveTolerant: false }));
+  assert.equal(strict.input({ time: 1, midi: 79 }), null, 'touch key G5 is not G4 when strict');
+  assert.equal(strict.stats.stray, 1);
+  assert.equal(strict.input({ time: 1.02, midi: 79, octaves: true }).index, 2, 'a detector strike matches by pitch class');
+
+  const any = new Judge(chord(), G({ anyPitch: true }));
+  assert.equal(any.input({ time: 1, midi: 30 }).index, 2);
+});
+
+test('groupMode: notes below the floor are display-only (auto) and never counted', () => {
+  // C2 bass (36) under a C major chord, A1 (33) alone, then a group made only of low notes, then D4.
+  const notes = [N(1, 36), N(1, 60), N(1, 64), N(1.5, 33), N(2, 35), N(2, 38), N(2.5, 62)];
+  const j = new Judge(notes, G());
+  assert.equal(j.stats.total, 2, 'the all-below-floor group at 2 is not a group');
+  assert.deepEqual(j.pendingGroup(), [1, 2]);
+  assert.equal(j.firstPending(), 1);
+  assert.equal(j.stateOf(0), 'pending', 'auto notes fall like pending ones');
+  assert.deepEqual(j.update(0.99), []);
+  assert.equal(j.stateOf(0), 'pending');
+  j.update(1);
+  assert.equal(j.stateOf(0), 'auto', 'auto once the song passes the onset');
+  assert.equal(j.judgedAt[0], 1);
+  assert.equal(j.stateOf(3), 'pending');
+  assert.equal(j.input({ time: 1.02, midi: 60 }).grade, 'perfect');
+  j.update(2);
+  assert.deepEqual([j.stateOf(3), j.stateOf(4), j.stateOf(5)], ['auto', 'auto', 'auto']);
+  assert.ok(Number.isNaN(j.judgedAt[6]));
+  assert.equal(j.firstPending(), 6, 'auto notes never become the pending group');
+  assert.equal(j.input({ time: 2.5, midi: 62 }).grade, 'perfect');
+  const s = j.stats;
+  assert.equal(s.score, 1000000);
+  assert.equal(s.judged, 2);
+  assert.equal(s.combo, 2);
+  assert.deepEqual(s.counts, { perfect: 2, great: 0, good: 0, miss: 0 });
+  assert.equal(s.rank, 'S');
+
+  // Everything below the floor: nothing to judge.
+  const low = new Judge([N(1, 30), N(1, 37), N(2, 40)], G());
+  assert.equal(low.stats.total, 0);
+  assert.equal(low.firstPending(), -1);
+  assert.deepEqual(low.pendingGroup(), []);
+  assert.deepEqual(low.update(5), []);
+  assert.deepEqual(low.states, ['auto', 'auto', 'auto']);
+  assert.equal(low.stats.score, 0);
+  assert.equal(low.stats.counts.miss, 0);
+
+  // Without groupMode the floor is ignored.
+  const plain = new Judge([N(1, 30), N(2, 60)], { floor: 41 });
+  assert.equal(plain.stats.total, 2);
+  assert.equal(plain.input({ time: 1, midi: 30 }).index, 0);
+});
+
+test('groupMode: playing a below-floor note is neither a stray nor an early hit of the next chord', () => {
+  // Low B1 (35, auto) at 2, then a chord with B3 at 2.2.
+  const notes = [N(1, 60), N(2, 35), N(2.2, 59), N(2.2, 62)];
+  const j = new Judge(notes, G());
+  j.input({ time: 1, midi: 60 });
+  assert.equal(j.input({ time: 2.02, midi: 47, octaves: true }), null, 'the bass strike is taken by the auto note');
+  assert.equal(j.stats.stray, 0);
+  assert.deepEqual(j.pendingGroup(), [2, 3]);
+  assert.equal(j.input({ time: 2.2, midi: 59 }).grade, 'perfect');
+  // Same onset as a chord: the chord wins the tie.
+  const k = new Judge([N(1, 36), N(1, 60), N(1, 64)], G());
+  assert.equal(k.input({ time: 1, midi: 48 }).grade, 'perfect');
+  // A non-matching pitch near an auto note is still a stray.
+  const m = new Judge([N(1, 36), N(2, 60)], G());
+  assert.equal(m.input({ time: 1, midi: 62 }), null);
+  assert.equal(m.stats.stray, 1);
+});
+
+test('groupMode: a missed chord is one miss for the whole group', () => {
+  const notes = [N(1, 60), N(1, 64), N(1, 67), N(2, 62), N(2, 65), N(3, 64)];
+  const j = new Judge(notes, G());
+  const events = [];
+  j.on('judge', (r) => events.push(r));
+  j.input({ time: 1, midi: 67 });
+  assert.equal(j.stats.combo, 1);
+  const misses = j.update(2.5);
+  assert.equal(misses.length, 1);
+  assert.equal(misses[0].grade, 'miss');
+  assert.equal(misses[0].index, 4);
+  assert.deepEqual(misses[0].indices, [3, 4]);
+  assert.deepEqual(j.states, ['perfect', 'perfect', 'perfect', 'miss', 'miss', 'pending']);
+  assert.equal(j.judgedAt[3], 2.5);
+  const s = j.stats;
+  assert.equal(s.combo, 0);
+  assert.equal(s.maxCombo, 1);
+  assert.deepEqual(s.counts, { perfect: 1, great: 0, good: 0, miss: 1 });
+  assert.equal(s.judged, 2);
+  assert.equal(s.total, 3);
+  assert.equal(s.score, Math.round(1e6 / 3));
+  assert.equal(events.length, 2);
+  // A missed chord cannot be hit afterwards.
+  assert.equal(j.input({ time: 2.05, midi: 62 }), null);
+});
+
+test('groupMode: practice hitHeld hits the earliest pending group by any of its notes', () => {
+  const notes = [N(1, 48), N(1, 60), N(1, 64), N(2, 62), N(2, 65), N(3, 40), N(3, 64)];
+  const j = new Judge(notes, G({ noMiss: true, octaveTolerant: false }));
+  assert.deepEqual(j.hitHeld(62), [], 'not in the earliest group');
+  assert.deepEqual(j.hitHeld(76), [], 'strict: no octave');
+  let r = j.hitHeld(64);
+  assert.equal(r.length, 1, 'one result for the group');
+  assert.equal(r[0].index, 2);
+  assert.deepEqual(r[0].indices, [0, 1, 2]);
+  assert.equal(r[0].grade, 'good');
+  assert.equal(r[0].delta, 0);
+  assert.deepEqual(j.states.slice(0, 3), ['good', 'good', 'good']);
+  assert.equal(j.judgedAt[0], 1, 'default judgedAt is the onset');
+  assert.deepEqual(j.pendingGroup(), [3, 4]);
+  assert.equal(j.firstPending(), 3);
+  // A detector strike matches by pitch class even when strict; timed inside the window.
+  r = j.hitHeld(77, -0.05, 2.1, { octaves: true });
+  assert.equal(r.length, 1);
+  assert.equal(r[0].grade, 'perfect');
+  close(r[0].deltaReal, -0.05);
+  assert.equal(j.judgedAt[3], 2.1);
+  // The low E2 (40) at 3 is below the floor: the group is just E4.
+  assert.deepEqual(j.pendingGroup(), [6]);
+  assert.deepEqual(j.hitHeld(40), [], 'the auto note does not count');
+  assert.equal(j.hitHeld(64)[0].index, 6);
+  assert.equal(j.firstPending(), -1);
+  assert.deepEqual(j.hitHeld(64), []);
+  assert.deepEqual(j.update(100), [], 'noMiss');
+  assert.equal(j.stateOf(5), 'auto');
+  const s = j.stats;
+  assert.equal(s.total, 3);
+  assert.deepEqual(s.counts, { perfect: 1, great: 0, good: 2, miss: 0 });
+  assert.equal(s.combo, 3);
+  assert.equal(s.deltas.length, 1);
+});
+
+test('groupMode: a late player on repeated chords keeps their own chords (bias and shift on groups)', () => {
+  // Repeated chords in pairs, 0.25 s apart, each struck 130 ms late on a fresh judge (no lead-in), like the
+  // per-note test with single notes. The detector reports a different chord tone each time.
+  const chords = [[60, 64, 67], [60, 64, 67], [62, 65, 69], [62, 65, 69], [59, 62, 67], [59, 62, 67], [60, 64, 67]];
+  const notes = [];
+  chords.forEach((c, k) => c.forEach((m) => notes.push(N(k * 0.25, m))));
+  const j = new Judge(notes, G());
+  const got = chords.map((c, k) => j.input({ time: k * 0.25 + 0.13, midi: c[k % 3], octaves: true }));
+  assert.ok(got.every(Boolean), 'no strike is a stray');
+  j.update(10);
+  const s = j.stats;
+  assert.deepEqual(s.counts, { perfect: 0, great: 7, good: 0, miss: 0 });
+  assert.equal(s.stray, 0);
+  assert.equal(s.score, 700000);
+  assert.equal(s.combo, 7);
+  assert.equal(s.deltas.length, 7);
+  for (const d of s.deltas) close(d, 0.13);
+  assert.ok(j.states.every((x) => x === 'great'));
+});
+
+test('groupMode: later notes of a chord already hit stay with it (spread fingers, the other hand)', () => {
+  // Repeated C major eighth-note chords at 120 BPM (original material).
+  const ts = [1, 1.25, 1.5, 1.75];
+  const chords = (withBass) => {
+    const out = [];
+    for (const t of ts) {
+      if (withBass) out.push(N(t, 48));
+      out.push(N(t, 60), N(t, 64), N(t, 67));
+    }
+    return out;
+  };
+  const run = (notes, presses, opts = {}) => {
+    const j = new Judge(notes, G(opts));
+    const events = [];
+    j.on('judge', (r) => events.push(r));
+    const got = presses.map(([time, midi, octaves]) => {
+      j.update(time);
+      return j.input({ time, midi, octaves });
+    });
+    j.update(10);
+    return { j, events, got };
+  };
+
+  // Touch: three fingers land 0 / 40 / 60 ms apart, on time.
+  const touch = [];
+  for (const t of ts) touch.push([t, 60], [t + 0.04, 64], [t + 0.06, 67]);
+  let r = run(chords(false), touch);
+  assert.deepEqual(r.j.stats.counts, { perfect: 4, great: 0, good: 0, miss: 0 });
+  assert.equal(r.j.stats.stray, 0, 'the later fingers are not strays');
+  assert.equal(r.j.stats.score, 1000000);
+  assert.deepEqual(r.events.map((e) => e.note.t), ts, 'one event per chord, each at its own onset');
+  for (const e of r.events) close(e.delta, 0);
+  assert.deepEqual(r.got.map((x) => (x ? x.grade : null)),
+    ['perfect', null, null, 'perfect', null, null, 'perfect', null, null, 'perfect', null, null]);
+
+  // Mic: the right hand at the onset, the left-hand C3 (above the floor) 80 ms later — a separate onset for the
+  // detector (beyond its refractory time).
+  const mic = [];
+  for (const t of ts) mic.push([t, 60, true], [t, 64, true], [t, 67, true], [t + 0.08, 48, true]);
+  r = run(chords(true), mic);
+  assert.deepEqual(r.j.stats.counts, { perfect: 4, great: 0, good: 0, miss: 0 });
+  assert.equal(r.j.stats.stray, 0);
+  assert.equal(r.j.stats.deltas.length, 4);
+
+  // A late player (130 ms, repeated chords in pairs as in the test above): the second hand 80 ms later changes
+  // nothing — the shift back to their own chords still works.
+  const pairs = [[60, 64, 67], [60, 64, 67], [62, 65, 69], [62, 65, 69], [59, 62, 67], [59, 62, 67], [60, 64, 67]];
+  const bass = [48, 48, 50, 50, 43, 43, 48];
+  const pairNotes = [];
+  pairs.forEach((c, k) => pairNotes.push(N(k * 0.25, bass[k]), ...c.map((m) => N(k * 0.25, m))));
+  for (const twoHands of [false, true]) {
+    const late = [];
+    pairs.forEach((c, k) => {
+      late.push([k * 0.25 + 0.13, c[k % 3], true]);
+      if (twoHands) late.push([k * 0.25 + 0.21, bass[k], true]);
+    });
+    r = run(pairNotes, late);
+    assert.deepEqual(r.j.stats.counts, { perfect: 0, great: 7, good: 0, miss: 0 }, `two hands: ${twoHands}`);
+    assert.equal(r.j.stats.stray, 0);
+    for (const d of r.j.stats.deltas) close(d, 0.13);
+  }
+
+  // A strike well after the chord (beyond CHORD_SPREAD) with nothing to hit is still a stray.
+  const k = new Judge([N(1, 60), N(1, 64), N(3, 62)], G());
+  assert.equal(k.input({ time: 1, midi: 60 }).grade, 'perfect');
+  assert.equal(k.input({ time: 1 + CHORD_SPREAD + 0.05, midi: 64 }), null);
+  assert.equal(k.stats.stray, 1);
+  // Fast chords: the strike for the next chord is nearer that chord than the one just hit, so it hits it.
+  const fast = [];
+  for (const t of [1, 1.1, 1.2]) fast.push(N(t, 60), N(t, 64));
+  const f = new Judge(fast, G());
+  assert.equal(f.input({ time: 1, midi: 60 }).note.t, 1);
+  assert.equal(f.input({ time: 1.1, midi: 64 }).note.t, 1.1);
+  assert.equal(f.input({ time: 1.19, midi: 60 }).note.t, 1.2);
+  assert.equal(f.stats.counts.perfect, 3);
+});
+
+test('groupMode practice: the other fingers of a held chord do not hit the next chord early', () => {
+  const notes = [];
+  for (const t of [1, 1.25, 1.5, 1.75, 2]) notes.push(N(t, 60), N(t, 64), N(t, 67));
+  const j = new Judge(notes, G({ noMiss: true }));
+  const holds = [];
+  for (let step = 0; step < 10; step++) {
+    const fp = j.firstPending();
+    if (fp < 0) break;
+    const t = notes[fp].t;                       // the song waits here
+    const r = j.hitHeld(60);                     // the first finger releases the hold
+    holds.push([t, r.length]);
+    assert.equal(j.input({ time: t + 0.04, midi: 64 }), null, `second finger at ${t}`);
+    assert.equal(j.input({ time: t + 0.06, midi: 67 }), null, `third finger at ${t}`);
+  }
+  assert.deepEqual(holds, [[1, 1], [1.25, 1], [1.5, 1], [1.75, 1], [2, 1]], 'every chord is held and released once');
+  assert.deepEqual(j.stats.counts, { perfect: 0, great: 0, good: 5, miss: 0 });
+  assert.equal(j.stats.stray, 0);
+  // reset forgets the held hit
+  j.reset();
+  assert.equal(j.input({ time: 1.04, midi: 64 }).note.t, 1);
+});
+
+test('groupMode: unsorted input uses caller indices; reset restores auto notes', () => {
+  const notes = [N(2, 64), N(1, 67), N(1, 30), N(1, 60), N(2, 60)];
+  const j = new Judge(notes, G());
+  assert.equal(j.firstPending(), 3);
+  assert.deepEqual(j.pendingGroup(), [3, 1]);
+  const r = j.input({ time: 1, midi: 60 });
+  assert.equal(r.index, 1, 'top note');
+  assert.deepEqual(r.indices, [3, 1]);
+  j.update(1.5);
+  assert.equal(j.stateOf(2), 'auto');
+  assert.deepEqual(j.update(3).map((x) => x.indices), [[4, 0]]);
+  j.reset();
+  assert.deepEqual(j.states, ['pending', 'pending', 'pending', 'pending', 'pending']);
+  assert.equal(j.stats.judged, 0);
+  assert.equal(j.firstPending(), 3);
+  j.update(1);
+  assert.equal(j.stateOf(2), 'auto');
 });
