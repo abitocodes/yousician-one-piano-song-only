@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d17">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="실제 피아노로 치면 마이크가 음정과 타이밍을 판정하는 노래방 스타일 리듬게임. 떨어지는 노트를 따라 치고 가사를 함께 불러 보세요.">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="피아노노래방">
+  <meta name="format-detection" content="telephone=no">
+  <title>피아노 노래방</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="icon" type="image/png" sizes="512x512" href="icons/icon-512.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/play.css">
+  <link rel="stylesheet" href="css/editor.css">
+  <link rel="stylesheet" href="css/calibrate.css">
+  <link rel="modulepreload" href="js/app.js">
+</head>
+<body data-screen="boot">
+  <noscript>
+    <div class="noscript">피아노 노래방을 사용하려면 자바스크립트를 켜 주세요.<br>최신 Chrome 또는 삼성 인터넷 브라우저를 권장해요.</div>
+  </noscript>
+
+  <div id="boot" class="boot" role="status" aria-live="polite">
+    <img class="boot-logo" src="icons/icon-192.png" alt="" width="96" height="96">
+    <div class="boot-title">피아노 노래방</div>
+    <div class="boot-msg">불러오는 중…</div>
+  </div>
+
+  <main id="app">
+    <section class="screen" data-screen="home" hidden></section>
+    <section class="screen" data-screen="play" hidden></section>
+    <section class="screen" data-screen="results" hidden></section>
+    <section class="screen" data-screen="settings" hidden></section>
+    <section class="screen" data-screen="calibrate" hidden></section>
+    <section class="screen" data-screen="editor" hidden></section>
+  </main>
+
+  <div id="toast-root" aria-live="polite"></div>
+  <div id="modal-root"></div>
+
+  <script nomodule>
+    document.querySelector('#boot .boot-msg').textContent = '이 브라우저는 너무 오래되어 실행할 수 없어요. 최신 Chrome 또는 삼성 인터넷으로 열어 주세요.';
+  </script>
+  <script>
+    // Boot watchdog: if the module graph fails to load (old browser, network error), explain instead of a blank screen.
+    setTimeout(function () {
+      if (window.__pkBooted) return;
+      var msg = document.querySelector('#boot .boot-msg');
+      if (!msg) return;
+      msg.textContent = '앱을 불러오지 못했어요. 네트워크 상태를 확인하거나 최신 Chrome·삼성 인터넷에서 다시 열어 주세요.';
+      var btn = document.createElement('button');
+      btn.className = 'btn primary';
+      btn.type = 'button';
+      btn.textContent = '새로고침';
+      btn.onclick = function () { location.reload(); };
+      msg.appendChild(document.createElement('br'));
+      msg.appendChild(btn);
+    }, 12000);
+  </script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

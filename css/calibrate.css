@@ -1,0 +1,516 @@
+/* 마이크 · 보정 화면 */
+
+[data-screen="calibrate"] .cal-wrap {
+  display: flex;
+  flex-direction: column;
+  min-height: var(--app-h);
+}
+
+[data-screen="calibrate"] .cal-body {
+  flex: 1 1 auto;
+  width: 100%;
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 16px 16px calc(28px + var(--safe-b));
+}
+
+[data-screen="calibrate"] .cal-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+}
+
+@media (min-width: 900px) {
+  [data-screen="calibrate"] .cal-grid { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); }
+}
+
+[data-screen="calibrate"] .cal-col {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+[data-screen="calibrate"] .cal-card {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 18px;
+}
+
+[data-screen="calibrate"] .cal-h {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 1.15rem;
+  font-weight: 800;
+}
+
+[data-screen="calibrate"] .cal-step {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent-grad);
+  color: #fff;
+  font-size: 0.9rem;
+}
+
+[data-screen="calibrate"] .cal-lead {
+  margin: 0;
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
+/* ------------------------------------------------------------------ mic state */
+
+[data-screen="calibrate"] .cal-state-chip { flex: none; }
+
+[data-screen="calibrate"] .cal-state-chip[data-state="running"] {
+  border-color: rgba(74, 222, 128, 0.55);
+  background: rgba(74, 222, 128, 0.14);
+}
+
+[data-screen="calibrate"] .cal-state-chip[data-state="requesting"] {
+  border-color: rgba(255, 216, 77, 0.5);
+  background: rgba(255, 216, 77, 0.12);
+}
+
+[data-screen="calibrate"] .cal-state-chip[data-state="denied"],
+[data-screen="calibrate"] .cal-state-chip[data-state="error"],
+[data-screen="calibrate"] .cal-state-chip[data-state="unsupported"] {
+  border-color: rgba(248, 113, 113, 0.55);
+  background: rgba(248, 113, 113, 0.14);
+}
+
+[data-screen="calibrate"] .cal-micbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 16px;
+}
+
+[data-screen="calibrate"] .cal-mic-btn { min-width: 200px; }
+
+[data-screen="calibrate"] .cal-mic-msg {
+  flex: 1 1 200px;
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+[data-screen="calibrate"] .cal-error {
+  padding: 12px 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(248, 113, 113, 0.55);
+  background: rgba(248, 113, 113, 0.1);
+}
+
+[data-screen="calibrate"] .cal-error strong {
+  display: block;
+  margin-bottom: 4px;
+  color: #fecaca;
+}
+
+[data-screen="calibrate"] .cal-error p {
+  margin: 0;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
+/* ------------------------------------------------------------------ level meter */
+
+[data-screen="calibrate"] .cal-meter {
+  display: grid;
+  gap: 6px;
+}
+
+[data-screen="calibrate"] .cal-meter-track {
+  position: relative;
+  height: 20px;
+  overflow: hidden;
+  border-radius: 999px;
+  border: 1px solid var(--line-soft);
+  background: #1c2244;
+}
+
+[data-screen="calibrate"] .cal-meter-fill {
+  position: absolute;
+  inset: 0;
+  transform: scaleX(0);
+  transform-origin: left center;
+  background: linear-gradient(90deg, #3b4470, #5b648f);
+  transition: transform 0.06s linear;
+}
+
+[data-screen="calibrate"] .cal-meter-fill.open {
+  background: linear-gradient(90deg, var(--great), var(--accent-2) 70%, var(--perfect));
+}
+
+[data-screen="calibrate"] .cal-meter-gate {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 3px;
+  margin-left: -1.5px;
+  border-radius: 2px;
+  background: #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.45);
+  transition: left 0.25s ease;
+}
+
+[data-screen="calibrate"] .cal-meter-labels {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-screen="calibrate"] .cal-db { font-weight: 800; }
+
+/* ------------------------------------------------------------------ detected pitch */
+
+[data-screen="calibrate"] .cal-pitch {
+  display: grid;
+  grid-template-columns: minmax(140px, auto) minmax(0, 1fr);
+  align-items: center;
+  gap: 18px;
+  padding: 14px 16px;
+  border-radius: 14px;
+  border: 1px solid var(--line-soft);
+  background: var(--bg-2);
+}
+
+@media (max-width: 520px) {
+  [data-screen="calibrate"] .cal-pitch { grid-template-columns: minmax(0, 1fr); }
+}
+
+[data-screen="calibrate"] .cal-note {
+  text-align: center;
+  transition: opacity 0.3s ease;
+}
+
+[data-screen="calibrate"] .cal-note.stale { opacity: 0.4; }
+
+[data-screen="calibrate"] .cal-note-main {
+  font-size: 3.2rem;
+  font-weight: 900;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+}
+
+[data-screen="calibrate"] .cal-note-sub {
+  font-size: 0.95rem;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-screen="calibrate"] .cal-tuner {
+  display: grid;
+  gap: 6px;
+}
+
+[data-screen="calibrate"] .cal-tuner-scale {
+  position: relative;
+  height: 44px;
+  border-radius: 10px;
+  background: linear-gradient(90deg,
+    rgba(248, 113, 113, 0.28), rgba(255, 216, 77, 0.2) 30%, rgba(74, 222, 128, 0.32) 45%,
+    rgba(74, 222, 128, 0.32) 55%, rgba(255, 216, 77, 0.2) 70%, rgba(248, 113, 113, 0.28));
+}
+
+[data-screen="calibrate"] .cal-tick {
+  position: absolute;
+  top: 10px;
+  bottom: 10px;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.3);
+}
+
+[data-screen="calibrate"] .cal-tick-center {
+  top: 3px;
+  bottom: 3px;
+  width: 2px;
+  margin-left: -1px;
+  background: rgba(255, 255, 255, 0.85);
+}
+
+[data-screen="calibrate"] .cal-needle {
+  position: absolute;
+  top: -2px;
+  bottom: -2px;
+  left: 50%;
+  width: 5px;
+  margin-left: -2.5px;
+  border-radius: 3px;
+  background: var(--perfect);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  transition: left 0.12s ease, opacity 0.2s ease, background-color 0.2s ease;
+}
+
+[data-screen="calibrate"] .cal-needle.on { opacity: 1; }
+[data-screen="calibrate"] .cal-needle.on.good { background: var(--great); }
+
+[data-screen="calibrate"] .cal-tuner-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+}
+
+[data-screen="calibrate"] .cal-cents-text {
+  font-size: 0.9rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+/* ------------------------------------------------------------------ recent notes */
+
+[data-screen="calibrate"] .cal-recent {
+  display: grid;
+  gap: 8px;
+}
+
+[data-screen="calibrate"] .cal-recent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+[data-screen="calibrate"] .cal-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+[data-screen="calibrate"] .cal-chips-empty { font-size: 0.88rem; }
+
+[data-screen="calibrate"] .cal-note-chip { font-variant-numeric: tabular-nums; }
+[data-screen="calibrate"] .cal-note-chip.legato { border-style: dashed; }
+[data-screen="calibrate"] .cal-note-chip.new { animation: cal-pop 0.35s ease both; }
+
+/* ------------------------------------------------------------------ settings */
+
+[data-screen="calibrate"] .cal-field {
+  display: grid;
+  gap: 6px;
+}
+
+[data-screen="calibrate"] .cal-label {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 0.95rem;
+  font-weight: 800;
+}
+
+[data-screen="calibrate"] .cal-val {
+  color: var(--accent-2);
+  font-variant-numeric: tabular-nums;
+}
+
+[data-screen="calibrate"] .cal-hint {
+  margin: 0;
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+[data-screen="calibrate"] .cal-range-ends {
+  display: flex;
+  justify-content: space-between;
+  margin-top: -4px;
+  font-size: 0.75rem;
+}
+
+[data-screen="calibrate"] .cal-inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+[data-screen="calibrate"] .cal-inline input[type="range"] { flex: 1 1 auto; }
+[data-screen="calibrate"] .cal-inline .btn { flex: none; }
+
+[data-screen="calibrate"] .cal-seg { display: flex; width: 100%; }
+[data-screen="calibrate"] .cal-seg > button { padding: 0 8px; }
+
+[data-screen="calibrate"] .cal-switch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 52px;
+  cursor: pointer;
+}
+
+[data-screen="calibrate"] .cal-switch-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* ------------------------------------------------------------------ latency */
+
+[data-screen="calibrate"] .cal-lat-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+
+[data-screen="calibrate"] .cal-lat-val {
+  min-width: 140px;
+  font-size: 2rem;
+  font-weight: 900;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-screen="calibrate"] .cal-auto {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+}
+
+[data-screen="calibrate"] .cal-steps {
+  margin: 0;
+  padding-left: 1.3em;
+  font-size: 0.88rem;
+  line-height: 1.7;
+}
+
+[data-screen="calibrate"] .cal-result {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid rgba(34, 211, 238, 0.45);
+  background: rgba(34, 211, 238, 0.07);
+  animation: cal-pop 0.3s ease both;
+}
+
+[data-screen="calibrate"] .cal-result.bad {
+  border-color: rgba(248, 113, 113, 0.5);
+  background: rgba(248, 113, 113, 0.08);
+}
+
+[data-screen="calibrate"] .cal-result p { margin: 0; line-height: 1.6; }
+[data-screen="calibrate"] .cal-result-title { font-size: 1.05rem; font-weight: 900; }
+
+[data-screen="calibrate"] .cal-result-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 12px;
+}
+
+[data-screen="calibrate"] .cal-result-ms {
+  color: var(--accent-2);
+  font-size: 2.2rem;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-screen="calibrate"] .cal-result-sub { font-variant-numeric: tabular-nums; }
+
+[data-screen="calibrate"] .cal-result-warn {
+  margin: 0;
+  padding-left: 1.2em;
+  color: #fde68a;
+  font-size: 0.88rem;
+  line-height: 1.6;
+}
+
+[data-screen="calibrate"] .cal-result-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+[data-screen="calibrate"] .cal-strip {
+  display: grid;
+  gap: 4px;
+  padding: 0 6px;
+}
+
+[data-screen="calibrate"] .cal-strip-axis {
+  position: relative;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--line-soft);
+  background: var(--bg-2);
+}
+
+[data-screen="calibrate"] .cal-strip-zero {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  width: 1px;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+[data-screen="calibrate"] .cal-strip-dot {
+  position: absolute;
+  top: 50%;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border-radius: 50%;
+  background: var(--accent-2);
+  opacity: 0.8;
+}
+
+[data-screen="calibrate"] .cal-strip-med {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  margin-left: -1.5px;
+  border-radius: 2px;
+  background: var(--perfect);
+}
+
+[data-screen="calibrate"] .cal-strip-labels {
+  position: relative;
+  height: 16px;
+  font-size: 0.72rem;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-screen="calibrate"] .cal-strip-labels span {
+  position: absolute;
+  transform: translateX(-50%);
+  white-space: nowrap;
+}
+
+[data-screen="calibrate"] .cal-strip-labels span:first-child { transform: none; }
+[data-screen="calibrate"] .cal-strip-labels span:last-child { transform: translateX(-100%); }
+
+@keyframes cal-pop {
+  from { opacity: 0; transform: scale(0.85); }
+  to { opacity: 1; transform: none; }
+}
+
+@media (max-width: 640px) {
+  [data-screen="calibrate"] .cal-body { padding: 12px 12px calc(24px + var(--safe-b)); }
+  [data-screen="calibrate"] .cal-card { padding: 14px; }
+  [data-screen="calibrate"] .cal-note-main { font-size: 2.6rem; }
+  [data-screen="calibrate"] .cal-mic-btn { width: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-screen="calibrate"] .cal-note-chip.new,
+  [data-screen="calibrate"] .cal-result { animation: none; }
+  [data-screen="calibrate"] .cal-needle,
+  [data-screen="calibrate"] .cal-meter-gate { transition: none; }
+}

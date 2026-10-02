@@ -1,0 +1,11 @@
+{
+  "name": "piano-karaoke",
+  "version": "1.0.0",
+  "private": true,
+  "description": "마이크로 피아노 연주를 판정하는 노래방 스타일 리듬게임",
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "serve": "python -m http.server 8080"
+  }
+}

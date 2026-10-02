@@ -1,0 +1,36 @@
+{
+  "name": "피아노 노래방",
+  "short_name": "피아노노래방",
+  "description": "실제 피아노로 치면 마이크가 음정과 타이밍을 판정하는 노래방 스타일 리듬게임",
+  "lang": "ko",
+  "dir": "ltr",
+  "id": "./",
+  "start_url": "./",
+  "scope": "./",
+  "display": "fullscreen",
+  "display_override": ["fullscreen", "standalone"],
+  "orientation": "landscape",
+  "background_color": "#0b0d17",
+  "theme_color": "#0b0d17",
+  "categories": ["music", "games", "education"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
