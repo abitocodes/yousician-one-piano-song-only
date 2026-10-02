@@ -1,10 +1,14 @@
 // Bootstrap: settings/library/scores, screen router with Android back-button support, audio input,
-// fullscreen / orientation / wake-lock helpers, global error toasts and service worker registration.
+// fullscreen / orientation / wake-lock helpers, global error toasts, service worker registration and updates.
 
-import { Settings, Library, ScoreBook } from './core/storage.js';
-import { toast, closeTopModal } from './ui/dom.js';
+import { Settings, Library, ScoreBook, safeSessionStorage } from './core/storage.js';
+import {
+  createUpdater, serviceWorkerMode, inputNeeded, isSafePoint, looksLikeModuleLoadError,
+} from './core/lifecycle.js';
+import { toast, closeTopModal, isModalOpen, isPickingFile, onModalChange } from './ui/dom.js';
 
-export const APP_VERSION = '1.0.0';
+// Build stamp ('<package version>+<content hash>'), written by tools/stamp-version.mjs together with sw.js VERSION.
+export const APP_VERSION = '1.0.0+d76df55e';
 
 const SCREENS = ['home', 'play', 'results', 'settings', 'calibrate', 'editor'];
 const TRANSIENT = new Set(['play', 'results']);
@@ -88,6 +92,22 @@ async function ensureInput() {
     await inp.startMic();
   }
   return inp;
+}
+
+/**
+ * Stops the shared input (microphone or simulation) when no screen needs it: the mic-in-use indicator goes off and
+ * the detector stops using the CPU / battery. play, calibrate and the editor's recorder start it again on demand.
+ */
+function releaseInput() {
+  const inp = input;
+  if (!inp || (inp.state !== 'running' && inp.state !== 'requesting')) return;
+  try { inp.stop(); } catch (err) { console.warn('[app] input stop', err); }
+}
+
+/** Releases the input unless the screen on display uses it right now (see inputNeeded in core/lifecycle.js). */
+function releaseInputIfUnused() {
+  if (navigating) return; // mid-navigation, mountScreen decides
+  if (!inputNeeded(current?.name, { mod: current?.mod, modalOpen: isModalOpen() })) releaseInput();
 }
 
 /** Korean explanation for an error thrown by ensureInput()/startMic(). */
@@ -212,7 +232,25 @@ async function keepAwake(on) {
 }
 
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && wakeWanted) keepAwake(true);
+  if (document.visibilityState === 'visible') {
+    if (wakeWanted) keepAwake(true);
+    updater.checkForUpdate();
+    return;
+  }
+  // Hidden while nothing uses the input: release the mic (a capturing tab is never frozen, so it would keep recording
+  // and analysing in the background).
+  releaseInputIfUnused();
+  updater.maybeApply();
+});
+
+// A dialog closed: the editor's recorder may have been the last user of the mic, and on home this can be the safe
+// point a waiting update needs. Next task, so a navigation started from the dialog's button is under way by then.
+onModalChange((open) => {
+  if (open) return;
+  setTimeout(() => {
+    releaseInputIfUnused();
+    updater.maybeApply();
+  }, 0);
 });
 
 function updateViewportVars() {
@@ -254,6 +292,7 @@ function enqueue(task) {
       console.error('[router]', err);
     } finally {
       navigating = false;
+      updater.maybeApply(); // a pending update waits for a safe point such as arriving on home
     }
   };
   navQueue = navQueue.then(run, run);
@@ -292,11 +331,15 @@ async function mountScreen(name, params) {
     prev.root.replaceChildren();
     prev.root.hidden = true;
   }
+  if (!inputNeeded(name)) releaseInput();
   let mod;
   try {
     mod = await loadScreen(name);
   } catch (err) {
     console.error(`[router] load ${name}`, err);
+    // A module that fails to fetch or link (e.g. it was deployed after this page booted) keeps failing until the
+    // page reloads, because the failed record stays in the module map. Reload once by ourselves.
+    if (looksLikeModuleLoadError(err) && updater.reloadAfterLoadFailure()) return;
     toast('화면을 불러오지 못했어요. 네트워크 상태를 확인하고 새로고침해 주세요.', { type: 'error' });
     if (name !== 'home') {
       stack = [];
@@ -343,7 +386,13 @@ function fatalPanel(err) {
   btn.className = 'btn primary';
   btn.type = 'button';
   btn.textContent = '새로고침';
-  btn.addEventListener('click', () => location.reload());
+  btn.addEventListener('click', () => {
+    btn.disabled = true;
+    // A plain reload would start this same cached version again: index.html's recovery activates a fixed version
+    // that waits, or (online) clears this app's worker and caches first.
+    if (typeof window.__pkRecover === 'function') window.__pkRecover();
+    else location.reload();
+  });
   box.append(title, msg, btn);
   return box;
 }
@@ -471,41 +520,58 @@ window.addEventListener('unhandledrejection', (e) => {
   reportError(e.reason);
 });
 
-// ---------------------------------------------------------------- service worker
+// ---------------------------------------------------------------- service worker & updates
+// sw.js serves one consistent file set per deploy (see the comment there). A new deploy installs as a *waiting*
+// worker; the updater (core/lifecycle.js) lets it take over only at a safe point — on the home screen with no
+// dialog, file picker or import in progress — and then reloads, so a song, a calibration or an unsaved chart is
+// never interrupted and a running page never mixes files from two deploys. If another tab activated it first, the
+// reload likewise waits for the next visit to home.
 
-async function registerServiceWorker() {
-  if (!('serviceWorker' in navigator)) return;
-  if (query.has('nosw')) {
-    try {
-      const regs = await navigator.serviceWorker.getRegistrations();
-      await Promise.all(regs.map((r) => r.unregister()));
-    } catch { /* ignore */ }
-    return;
-  }
-  const local = ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
-  if (location.protocol !== 'https:' && !local) return;
-  try {
-    const hadController = !!navigator.serviceWorker.controller;
-    await navigator.serviceWorker.register('sw.js');
-    navigator.serviceWorker.addEventListener('controllerchange', () => {
-      if (hadController) toast('새 버전이 설치되었어요. 앱을 다시 열면 적용돼요.', { type: 'success', duration: 4000 });
-    });
-  } catch (err) {
-    console.warn('[app] service worker registration failed', err);
-  }
+const updater = createUpdater({
+  version: APP_VERSION,
+  container: 'serviceWorker' in navigator ? navigator.serviceWorker : null,
+  scopeUrl: new URL('./', location.href).href,
+  cacheStorage: typeof caches !== 'undefined' ? caches : null,
+  storage: safeSessionStorage,
+  reload: () => location.reload(),
+  notify: (msg, opts) => toast(msg, opts),
+  isSafePoint: () => isSafePoint({
+    screen: current?.name || null,
+    navigating,
+    modalOpen: isModalOpen(),
+    pickingFile: isPickingFile(),
+  }),
+  online: () => navigator.onLine !== false,
+});
+
+/** Registers (or, on localhost without ?sw and with ?nosw, removes) the service worker. Runs once. */
+function registerServiceWorker() {
+  return updater.start(serviceWorkerMode({ protocol: location.protocol, hostname: location.hostname, params: query }));
 }
 
-/** Removes the service worker and its caches, then reloads (settings → 문제 해결). */
-async function hardReload() {
-  try {
-    const regs = await navigator.serviceWorker?.getRegistrations?.() || [];
-    await Promise.all(regs.map((r) => r.unregister()));
-  } catch { /* ignore */ }
-  try {
-    const keys = await caches?.keys?.() || [];
-    await Promise.all(keys.map((k) => caches.delete(k)));
-  } catch { /* ignore */ }
-  location.reload();
+/** Removes this app's service worker and caches, then reloads (settings → 문제 해결). */
+function hardReload() {
+  return updater.hardReload();
+}
+
+/** Loads every lazily imported module while the files of the version this page booted with are current. */
+function warmUpModules() {
+  const loaders = [
+    ...SCREENS.map((name) => () => loadScreen(name)),
+    () => import('./core/musicxml.js'),
+  ];
+  const idle = (fn) => (typeof requestIdleCallback === 'function'
+    ? requestIdleCallback(fn, { timeout: 3000 })
+    : setTimeout(fn, 300));
+  // One module per idle period, so compiling the big editor does not stall a tap on the home screen.
+  const next = () => {
+    const load = loaders.shift();
+    if (!load) return;
+    Promise.resolve().then(load)
+      .catch(() => { /* retried (and reported) on first use */ })
+      .finally(() => idle(next));
+  };
+  idle(next);
 }
 
 // ---------------------------------------------------------------- app object
@@ -531,6 +597,8 @@ const app = {
   orientation,
   keepAwake,
   hardReload,
+  /** Keeps app updates from reloading the page (e.g. during an import) until the returned function is called. */
+  holdUpdates: () => updater.hold(),
   get screen() { return current?.name || null; },
 };
 
@@ -572,12 +640,17 @@ async function boot() {
   window.__pkBooted = true;
   await go('home');
   hideBootSplash();
+  updater.announce();
 
   const deep = query.get('screen');
   if (deep && ['settings', 'calibrate', 'editor'].includes(deep)) go(deep, {});
 
-  if (document.readyState === 'complete') registerServiceWorker();
-  else window.addEventListener('load', registerServiceWorker, { once: true });
+  const afterLoad = () => {
+    registerServiceWorker();
+    warmUpModules();
+  };
+  if (document.readyState === 'complete') afterLoad();
+  else window.addEventListener('load', afterLoad, { once: true });
 }
 
 window.pianoKaraoke = app;
@@ -588,6 +661,9 @@ boot().catch((err) => {
   const home = sections.home || document.body;
   home.hidden = false;
   home.replaceChildren(fatalPanel(err));
+  // A fixed deploy may already wait (or arrive later): with no screen to interrupt, the updater applies it at once.
+  if (document.readyState === 'complete') registerServiceWorker();
+  else window.addEventListener('load', () => registerServiceWorker(), { once: true });
 });
 
 export default app;

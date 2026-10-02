@@ -5,10 +5,11 @@ import { confirmDialog, syncRange } from '../ui/dom.js';
 
 const DB_MIN = -80;
 const DB_MAX = 0;
-const LAT_MIN_MS = -100;
-const LAT_MAX_MS = 400;
 const LAT_SETTING_MIN = -0.1;
 const LAT_SETTING_MAX = 0.5;
+// 슬라이더·±10 버튼 범위 = 설정값 범위 (자동 측정은 최대 500ms까지 적용할 수 있다)
+const LAT_MIN_MS = Math.round(LAT_SETTING_MIN * 1000);
+const LAT_MAX_MS = Math.round(LAT_SETTING_MAX * 1000);
 const MAX_CHIPS = 12;
 
 const INPUT_MODES = [
@@ -96,11 +97,23 @@ export function analyzeCalibration(stats, { minHits = 4 } = {}) {
   };
 }
 
-/** 검출기 게이트 근사치 (dBFS). 실제 검출기는 잡음 바닥을 직접 추적한다. */
+/**
+ * 검출기 게이트 근사치 (dBFS): detector.js와 같은 식 max(−40 − 25·s, 잡음 바닥 + (11 − 5·s)).
+ * 실제 검출기는 잡음 바닥을 직접 추적하므로 화면의 잡음 바닥 추정값으로 근사한다.
+ */
 export function estimateGateDb(sensitivity, noiseFloor) {
   const s = Number.isFinite(sensitivity) ? Math.min(1, Math.max(0, sensitivity)) : 0.6;
   const base = -40 - 25 * s;
-  return Number.isFinite(noiseFloor) ? Math.max(base, noiseFloor + 8) : base;
+  return Number.isFinite(noiseFloor) ? Math.max(base, noiseFloor + (11 - 5 * s)) : base;
+}
+
+/** 지연 슬라이더·±10 버튼 범위 (ms). 자동 측정 결과의 범위(LAT_SETTING_*)와 같다. */
+export const LATENCY_RANGE_MS = Object.freeze({ min: LAT_MIN_MS, max: LAT_MAX_MS });
+
+/** 현재 지연(초)에 ms만큼 더한 새 지연(초). 1ms 단위로 반올림하고 설정 범위로 자른다. */
+export function nudgeLatency(currentSec, ms) {
+  const cur = Number.isFinite(currentSec) ? currentSec : 0;
+  return clamp(Math.round(cur * 1000 + (Number.isFinite(ms) ? ms : 0)), LAT_MIN_MS, LAT_MAX_MS) / 1000;
 }
 
 /** AudioInput.startMic() 오류(.code) → 사용자 안내 문구. */
@@ -196,6 +209,7 @@ export async function mount(root, params = {}, app) {
     root,
     app,
     input: null,
+    inputFailed: false,
     offs: [],
     timer: 0,
     noiseFloor: NaN,
@@ -209,20 +223,10 @@ export async function mount(root, params = {}, app) {
   };
   S = s;
 
-  try {
-    s.input = app.getInput();
-  } catch (err) {
-    console.error(err);
-    s.input = null;
-  }
-
   build(s);
 
-  if (s.input) {
-    s.offs.push(s.input.on('analysis', (a) => onAnalysis(s, a)));
-    s.offs.push(s.input.on('note', (ev) => onNote(s, ev)));
-    s.offs.push(s.input.on('state', () => renderMicState(s)));
-  }
+  // 오디오 모듈이 아직 로드 중이면 null → 마이크 버튼을 누를 때 다시 연결한다.
+  attachInput(s);
   const settingsOff = app.settings && typeof app.settings.on === 'function'
     ? app.settings.on('change', () => renderSettings(s))
     : null;
@@ -235,6 +239,24 @@ export async function mount(root, params = {}, app) {
   resetLiveDisplay(s);
 
   if (params && params.calibrationResult) showResult(s, params.calibrationResult);
+}
+
+/** 공유 AudioInput을 가져와 이벤트를 연결한다 (한 번만). 오디오 모듈을 못 불러왔으면 null. */
+function attachInput(s) {
+  if (s.input) return s.input;
+  let input = null;
+  try {
+    input = s.app.getInput();
+  } catch (err) {
+    console.error(err);
+    input = null;
+  }
+  if (!input) return null;
+  s.input = input;
+  s.offs.push(input.on('analysis', (a) => onAnalysis(s, a)));
+  s.offs.push(input.on('note', (ev) => onNote(s, ev)));
+  s.offs.push(input.on('state', () => renderMicState(s)));
+  return input;
 }
 
 export function unmount() {
@@ -385,10 +407,7 @@ function build(s) {
     type: 'range', min: LAT_MIN_MS, max: LAT_MAX_MS, step: 5, 'aria-label': '입력 지연 보정 (ms)',
     onInput: (e) => setSetting(s, 'latency', clamp(Number(e.target.value), LAT_MIN_MS, LAT_MAX_MS) / 1000),
   });
-  const nudge = (ms) => {
-    const cur = Number(app.settings.get('latency')) || 0;
-    setSetting(s, 'latency', clamp(Math.round(cur * 1000 + ms), LAT_MIN_MS, LAT_MAX_MS) / 1000);
-  };
+  const nudge = (ms) => setSetting(s, 'latency', nudgeLatency(Number(app.settings.get('latency')) || 0, ms));
   ui.result = el('div', { class: 'cal-result', hidden: true, 'aria-live': 'polite' });
 
   const cardLatency = el('section', { class: 'card cal-card cal-card-latency' },
@@ -431,13 +450,9 @@ function build(s) {
 
 async function toggleMic(s) {
   if (s.busy) return;
-  const input = s.input;
-  if (!input) {
-    showError(s, micErrorMessage({ code: 'unsupported' }));
-    return;
-  }
-  if (input.state === 'running' && input.mode === 'mic') {
-    input.stop();
+  const cur = s.input;
+  if (cur && cur.state === 'running' && cur.mode === 'mic') {
+    cur.stop();
     s.startedHere = false;
     resetLiveDisplay(s);
     renderMicState(s);
@@ -447,8 +462,16 @@ async function toggleMic(s) {
   hideError(s);
   renderMicState(s);
   try {
-    // 사용자 제스처 안에서 가장 먼저 (app.unlockAudio는 마스터 볼륨도 맞춘다)
+    // 사용자 제스처 안에서 가장 먼저 (app.unlockAudio는 마스터 볼륨도 맞춘다).
+    // 오디오 모듈이 늦게 로드된 경우를 위해 입력 객체는 잠금 해제를 기다린 뒤에 가져온다.
     await (typeof s.app.unlockAudio === 'function' ? s.app.unlockAudio() : unlockAudio());
+    if (S !== s) return;
+    const input = attachInput(s);
+    if (!input) {
+      const err = new Error('오디오 기능을 불러오지 못했어요.');
+      err.code = 'unsupported';
+      throw err;
+    }
     if (input.state === 'running' && input.mode !== 'mic') input.stop();
     await input.startMic();
     if (S !== s) return;
@@ -457,6 +480,7 @@ async function toggleMic(s) {
   } catch (err) {
     console.error(err);
     if (S !== s) return;
+    if (!s.input) s.inputFailed = true;
     showError(s, micErrorMessage(err));
   } finally {
     s.busy = false;
@@ -477,7 +501,8 @@ function hideError(s) {
 
 function renderMicState(s) {
   const { ui, input } = s;
-  const state = input ? input.state : 'unsupported';
+  // 입력 객체가 아직 없으면(오디오 모듈 로드 중) 꺼진 상태로 보여주고, 버튼을 누를 때 다시 시도한다.
+  const state = input ? input.state : s.inputFailed ? 'unsupported' : 'idle';
   const mode = input ? input.mode : null;
   const running = state === 'running';
   let label = STATE_LABELS[state] || state;

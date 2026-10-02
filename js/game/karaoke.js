@@ -103,6 +103,16 @@ export function syllableProgress(t, d, time) {
   return Math.round(p * 500) / 500;
 }
 
+/**
+ * Font size for a line that is `need` px wide at the `base` size in a slot `avail` px wide. Shrinks to fit, but
+ * never below MIN_SCALE; a line still too wide at that size wraps (`wrap`) instead of being clipped.
+ */
+export function fitLineSize(base, avail, need) {
+  if (!(avail > 0) || !(need > avail)) return { size: base, wrap: false };
+  const size = Math.max(base * MIN_SCALE, Math.floor(base * (avail / need) * 0.98));
+  return { size, wrap: need * (size / base) > avail };
+}
+
 export class Karaoke {
   constructor(rootEl) {
     this.root = rootEl;
@@ -258,13 +268,11 @@ export class Karaoke {
     const lineEl = slot.lineEl;
     const base = this._fontBase;
     if (!lineEl || !base) return;
+    lineEl.classList.remove('is-wrap'); // measure the single-row width
     lineEl.style.fontSize = `${base}px`;
-    const avail = slot.el.clientWidth;
-    const need = lineEl.offsetWidth;
-    if (avail > 0 && need > avail) {
-      const size = Math.max(base * MIN_SCALE, Math.floor(base * (avail / need) * 0.98));
-      lineEl.style.fontSize = `${size}px`;
-    }
+    const { size, wrap } = fitLineSize(base, slot.el.clientWidth, lineEl.offsetWidth);
+    if (size !== base) lineEl.style.fontSize = `${size}px`;
+    if (wrap) lineEl.classList.add('is-wrap');
   }
 
   _setDots(slot, n) {
@@ -274,15 +282,20 @@ export class Karaoke {
     for (let k = 0; k < DOTS; k++) slot.dotEls[k].classList.toggle('off', k < DOTS - n);
   }
 
+  // --p sweeps the glyph box; 'is-on' / 'is-done' open the outline margins on the left once the wipe has started
+  // and on the right once it is complete (see .fill in play.css), so the glyph itself fills over the whole duration.
   _progress(slot, time) {
     const ts = slot.ts;
     const n = ts.length;
     for (let i = 0; i < n; i++) {
       const p = syllableProgress(ts[i], slot.ds[i], time);
-      if (p !== slot.ps[i]) {
-        slot.ps[i] = p;
-        slot.fills[i].style.setProperty('--p', String(p));
-      }
+      const prev = slot.ps[i];
+      if (p === prev) continue;
+      slot.ps[i] = p;
+      const fill = slot.fills[i];
+      fill.style.setProperty('--p', String(p));
+      if ((p > 0) !== (prev > 0)) fill.classList.toggle('is-on', p > 0);
+      if ((p >= 1) !== (prev >= 1)) fill.classList.toggle('is-done', p >= 1);
     }
   }
 }

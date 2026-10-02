@@ -393,12 +393,528 @@ test('MusicXML import contract used by the editor (original 2-bar 6/8 tune)', as
   assert.equal(res.stats.syllables, 6);
   assert.ok(Array.isArray(res.warnings));
   assert.equal(res.beatsPerBar, 6);
+  // the MIDI importer uses the same beat grid for the same time signature and ♩ tempo
+  const grid = ed.midiBeatGrid({ num: 6, den: 8 }, 60);
+  assert.equal(grid.bpm, res.bpm);
+  assert.equal(grid.beatsPerBar, res.beatsPerBar);
   assert.deepEqual(assignLyrics(res.lyricText, res.notes).warnings, []);
   // The BPM override is in the same beat unit as the returned bpm (the editor prefills its field with it).
   const same = mx.scoreToSong(score, { trackKey: key, includeLyrics: false, bpm: res.bpm });
   assert.deepEqual(same.notes.map((n) => n.t), res.notes.map((n) => n.t));
   const faster = mx.scoreToSong(score, { trackKey: key, includeLyrics: false, bpm: res.bpm * 2 });
   assert.ok(Math.abs(faster.notes[5].t - res.notes[5].t / 2) < 0.002);
+});
+
+// --- recovery (unsaved drafts) ------------------------------------------------
+
+const draftOf = (id, title, n = 1) => ({
+  id, title, notes: Array.from({ length: n }, (_, i) => ({ t: i, d: 1, m: 60 + i })),
+  lyrics: { text: '', source: 'notes', lines: [] },
+});
+
+test('recovery store: an old single-slot value migrates into the per-song map', () => {
+  const legacy = { id: 'song-a', isNew: true, savedAt: 1000, draft: draftOf('song-a', '새 곡 A', 3) };
+  const slots = ed.parseRecoveryStore(JSON.stringify(legacy));
+  assert.deepEqual(Object.keys(slots), ['song-a']);
+  assert.equal(slots['song-a'].isNew, true);
+  assert.equal(slots['song-a'].savedAt, 1000);
+  assert.equal(slots['song-a'].draft.notes.length, 3);
+  // id missing on the record → taken from the draft
+  assert.deepEqual(Object.keys(ed.parseRecoveryStore({ savedAt: 5, draft: draftOf('song-z', 'z') })), ['song-z']);
+
+  // new format round trip
+  const text = ed.serializeRecoveryStore(slots);
+  assert.equal(JSON.parse(text).v, 2);
+  assert.deepEqual(ed.parseRecoveryStore(text), slots);
+
+  // junk is ignored
+  assert.deepEqual(ed.parseRecoveryStore('not json'), {});
+  assert.deepEqual(ed.parseRecoveryStore(null), {});
+  assert.deepEqual(ed.parseRecoveryStore('[]'), {});
+  assert.deepEqual(ed.parseRecoveryStore({ v: 2, slots: { x: { id: 'x' }, y: null, z: { draft: [] } } }), {});
+});
+
+test('recovery store: editing another song never overwrites a pending draft; capped to the newest entries', () => {
+  let slots = ed.parseRecoveryStore({ id: 'new-a', isNew: true, savedAt: 1000, draft: draftOf('new-a', 'A') });
+  // the user opens existing song B and edits it → B gets its own slot, A stays
+  slots = ed.recoveryPut(slots, 'song-b', { id: 'song-b', isNew: false, savedAt: 2000, draft: draftOf('song-b', 'B') });
+  assert.deepEqual(Object.keys(slots).sort(), ['new-a', 'song-b']);
+  assert.equal(slots['new-a'].draft.title, 'A');
+  // saving B clears only B
+  const afterSave = ed.recoveryDrop(slots, (e) => e.id === 'song-b');
+  assert.deepEqual(Object.keys(afterSave), ['new-a']);
+
+  // cap: the slot being written is always kept, the oldest others are dropped
+  let many = {};
+  for (let i = 0; i < 8; i++) many = ed.recoveryPut(many, `s${i}`, { id: `s${i}`, isNew: false, savedAt: 100 + i, draft: draftOf(`s${i}`, '') }, 5);
+  assert.deepEqual(Object.keys(many).sort(), ['s3', 's4', 's5', 's6', 's7']);
+  const old = ed.recoveryPut(many, 'old', { id: 'old', isNew: false, savedAt: 1, draft: draftOf('old', '') }, 5);
+  assert.ok(old.old, 'the slot just written survives even when it is the oldest');
+  assert.equal(Object.keys(old).length, 5);
+});
+
+test('recovery candidates: same song newer than its last save; new song → every never-saved draft', () => {
+  const slots = {
+    'song-b': { id: 'song-b', isNew: false, savedAt: 5000, draft: draftOf('song-b', 'B') },
+    'song-b@x1': { id: 'song-b', isNew: false, savedAt: 7000, draft: draftOf('song-b', 'B2') },
+    'song-c': { id: 'song-c', isNew: false, savedAt: 1000, draft: draftOf('song-c', 'C') },
+    'new-a': { id: 'new-a', isNew: true, savedAt: 3000, draft: draftOf('new-a', 'A') },
+    'new-d': { id: 'new-d', isNew: true, savedAt: 9000, draft: draftOf('new-d', 'D') },
+  };
+  assert.deepEqual(ed.recoveryCandidates(slots, { id: 'song-b', updatedAt: 4000 }).map((c) => c.slot), ['song-b@x1', 'song-b']);
+  assert.deepEqual(ed.recoveryCandidates(slots, { id: 'song-b', updatedAt: 6000 }).map((c) => c.slot), ['song-b@x1']);
+  assert.deepEqual(ed.recoveryCandidates(slots, { id: 'song-c', updatedAt: 1000 }), []); // saved after the draft
+  assert.deepEqual(ed.recoveryCandidates(slots, {}).map((c) => c.slot), ['new-d', 'new-a']);
+  assert.deepEqual(ed.recoveryCandidates({}, {}), []);
+});
+
+test('recovery prompt: one draft → restore/discard; several → one button per draft + discard all', () => {
+  const one = ed.recoveryPrompt([{ slot: 'a', entry: { id: 'a', savedAt: 0, draft: draftOf('a', '연습곡', 2) } }]);
+  assert.deepEqual(one.options.map((o) => o.value), ['restore:0', 'discard']);
+  assert.match(one.message, /연습곡/);
+  assert.match(one.message, /다시 물어봐요/);
+  const existing = ed.recoveryPrompt([{ slot: 'a', entry: { id: 'a', savedAt: 0, draft: draftOf('a', '') } }], { existing: true });
+  assert.match(existing.options[1].label, /저장된 곡/);
+  assert.match(existing.message, /제목 없음/);
+  const two = ed.recoveryPrompt([
+    { slot: 'x', entry: { id: 'x', savedAt: 2, draft: draftOf('x', '둘째', 4) } },
+    { slot: 'y', entry: { id: 'y', savedAt: 1, draft: draftOf('y', '첫째', 1) } },
+  ]);
+  assert.deepEqual(two.options.map((o) => o.value), ['restore:0', 'restore:1', 'discard']);
+  assert.match(two.options[0].label, /둘째.*노트 4개/);
+  assert.match(two.options[2].label, /모두 버리고/);
+});
+
+test('recovery: a draft kept by closing the prompt survives saving the same song and is offered again', () => {
+  // the tab was killed while editing song B → its draft is newer than the last save (4000)
+  let slots = { 'song-b': { id: 'song-b', isNew: false, savedAt: 5000, draft: draftOf('song-b', 'B 많이 고침', 9) } };
+  assert.deepEqual(ed.recoveryCandidates(slots, { id: 'song-b', updatedAt: 4000 }).map((c) => c.slot), ['song-b']);
+  // the prompt is closed (backdrop / back key) → kept; this session edits in its own slot
+  slots = ed.recoveryKeep(slots, ['song-b']);
+  assert.equal(slots['song-b'].kept, true);
+  slots = ed.recoveryPut(slots, 'song-b@x1', ed.makeRecoveryEntry(draftOf('song-b', 'B 한 음 고침', 2), { now: 6000 }));
+  // the user fixes one note and saves (started at 6500, stamped 7000): only this session's draft goes away
+  slots = ed.recoveryAfterSave(slots, { id: 'song-b', slot: 'song-b@x1', before: 6500 });
+  assert.deepEqual(Object.keys(slots), ['song-b']);
+  // next time B is opened: the kept draft is older than the save but is not pruned, and is offered as older
+  slots = ed.recoveryPrune(slots, 'song-b', 7000);
+  assert.deepEqual(Object.keys(slots), ['song-b']);
+  const cands = ed.recoveryCandidates(slots, { id: 'song-b', updatedAt: 7000 });
+  assert.deepEqual(cands.map((c) => c.slot), ['song-b']);
+  const prompt = ed.recoveryPrompt(cands, { existing: true, updatedAt: 7000 });
+  assert.match(prompt.message, /저장한 곡보다 이전/);
+  assert.match(prompt.message, /B 많이 고침/);
+  // survives the localStorage round trip
+  assert.equal(ed.parseRecoveryStore(ed.serializeRecoveryStore(slots))['song-b'].kept, true);
+});
+
+test('recovery: drafts nobody kept are still dropped once a save supersedes them', () => {
+  const slots = {
+    'song-b': { id: 'song-b', isNew: false, savedAt: 5000, draft: draftOf('song-b', 'old') },
+    'song-b@k': { id: 'song-b', isNew: false, savedAt: 4500, kept: true, draft: draftOf('song-b', 'kept') },
+    'song-b@late': { id: 'song-b', isNew: false, savedAt: 9000, draft: draftOf('song-b', 'written while saving') },
+    'song-c': { id: 'song-c', isNew: false, savedAt: 100, draft: draftOf('song-c', 'C') },
+  };
+  // after a save that started at 6000: the session slot, and unkept older drafts of the same song
+  const after = ed.recoveryAfterSave(slots, { id: 'song-b', slot: 'song-b', before: 6000 });
+  assert.deepEqual(Object.keys(after).sort(), ['song-b@k', 'song-b@late', 'song-c']);
+  assert.deepEqual(Object.keys(ed.recoveryAfterSave(slots, { id: 'song-b', slot: '', before: 0 })).sort(), Object.keys(slots).sort());
+  // opening after a save at 8000 prunes only the unkept older one
+  assert.deepEqual(Object.keys(ed.recoveryPrune(slots, 'song-b', 8000)).sort(), ['song-b@k', 'song-b@late', 'song-c']);
+  // several candidates: the older-than-saved one is labelled
+  const cands = ed.recoveryCandidates(ed.recoveryPrune(slots, 'song-b', 8000), { id: 'song-b', updatedAt: 8000 });
+  assert.deepEqual(cands.map((c) => c.slot), ['song-b@late', 'song-b@k']);
+  const prompt = ed.recoveryPrompt(cands, { existing: true, updatedAt: 8000 });
+  assert.doesNotMatch(prompt.options[0].label, /저장본보다 이전/);
+  assert.match(prompt.options[1].label, /저장본보다 이전/);
+  // recoveryKeep marks only the listed slots and leaves the input alone
+  const kept = ed.recoveryKeep(slots, ['song-c']);
+  assert.equal(kept['song-c'].kept, true);
+  assert.equal(slots['song-c'].kept, undefined);
+  assert.equal(kept['song-b'], slots['song-b']);
+});
+
+test('recovery entry written after a save that raced with edits is newer than the save', () => {
+  const draft = draftOf('song-b', 'edited during save');
+  // clock reads the same millisecond as the library stamp (or earlier): still strictly after it
+  const e = ed.makeRecoveryEntry(draft, { isNew: false, now: 7000, notBefore: 7000 });
+  assert.equal(e.savedAt, 7001);
+  assert.equal(e.isNew, false);
+  assert.equal(e.id, 'song-b');
+  assert.equal(ed.makeRecoveryEntry(draft, { now: 9000, notBefore: 7000 }).savedAt, 9000);
+  // so opening the song later offers it instead of pruning it
+  const slots = { 'song-b': e };
+  assert.deepEqual(Object.keys(ed.recoveryPrune(slots, 'song-b', 7000)), ['song-b']);
+  assert.equal(ed.recoveryCandidates(slots, { id: 'song-b', updatedAt: 7000 }).length, 1);
+  assert.equal(ed.makeRecoveryEntry(draftOf('new-x', ''), { isNew: true, now: 5 }).isNew, true);
+});
+
+/** Minimal localStorage stand-in; quota = max characters of the stored value. */
+function fakeStorage(quota = Infinity) {
+  const map = new Map();
+  return {
+    map,
+    getItem: (k) => (map.has(k) ? map.get(k) : null),
+    setItem: (k, v) => {
+      if (String(v).length > quota) {
+        const err = new Error('quota');
+        err.name = 'QuotaExceededError';
+        throw err;
+      }
+      map.set(k, String(v));
+    },
+    removeItem: (k) => { map.delete(k); },
+  };
+}
+
+/** Installs `storage` as globalThis.localStorage for one test (works whether or not Node defines its own). */
+function useStorage(t, storage) {
+  const prev = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const set = (v) => Object.defineProperty(globalThis, 'localStorage', { value: v, configurable: true, writable: true });
+  set(storage);
+  t.after(() => {
+    if (prev) Object.defineProperty(globalThis, 'localStorage', prev);
+    else delete globalThis.localStorage;
+  });
+  return set;
+}
+
+test('recovery storage: the old single-slot pk.editorRecovery value is migrated on first read', (t) => {
+  const ls = fakeStorage();
+  useStorage(t, ls);
+  ls.setItem('pk.editorRecovery', JSON.stringify({ id: 'new-a', isNew: true, savedAt: 1000, draft: draftOf('new-a', 'A', 2) }));
+  const slots = ed.readRecoveryStore();
+  assert.deepEqual(Object.keys(slots), ['new-a']);
+  const stored = JSON.parse(ls.getItem('pk.editorRecovery'));
+  assert.equal(stored.v, 2);
+  assert.equal(stored.slots['new-a'].draft.title, 'A');
+  // later reads keep it; writing another song adds a slot next to it
+  ed.writeRecoveryStore(ed.recoveryPut(ed.readRecoveryStore(), 'song-b', { id: 'song-b', isNew: false, savedAt: 2000, draft: draftOf('song-b', 'B') }));
+  assert.deepEqual(Object.keys(ed.readRecoveryStore()).sort(), ['new-a', 'song-b']);
+  // empty map removes the key
+  ed.writeRecoveryStore({});
+  assert.equal(ls.getItem('pk.editorRecovery'), null);
+  // broken value → nothing, no throw
+  ls.setItem('pk.editorRecovery', '{broken');
+  assert.deepEqual(ed.readRecoveryStore(), {});
+});
+
+test('recovery storage: when the quota is exceeded the oldest other drafts are dropped first', (t) => {
+  let slots = {};
+  for (let i = 0; i < 3; i++) slots = ed.recoveryPut(slots, `s${i}`, { id: `s${i}`, isNew: false, savedAt: 10 + i, draft: draftOf(`s${i}`, '', 20) });
+  const ls = fakeStorage(ed.serializeRecoveryStore({ s0: slots.s0, s2: slots.s2 }).length);
+  const setStorage = useStorage(t, ls);
+  assert.equal(ed.writeRecoveryStore(slots, 's0'), true);
+  assert.deepEqual(Object.keys(JSON.parse(ls.getItem('pk.editorRecovery')).slots).sort(), ['s0', 's2']);
+  setStorage(fakeStorage(10));
+  assert.equal(ed.writeRecoveryStore(slots, 's0'), false); // gives up quietly
+  setStorage(undefined);
+  assert.deepEqual(ed.readRecoveryStore(), {}); // no storage at all
+  assert.equal(ed.writeRecoveryStore(slots), false);
+});
+
+// --- undo snapshots -------------------------------------------------------------
+
+const songDraft = () => ({
+  title: '', artist: '', description: '', bpm: 100, beatsPerBar: 4, offset: 0,
+  notes: [{ t: 0, d: 1, m: 60 }, { t: 1, d: 1, m: 62 }],
+  lyrics: { text: '가나', source: 'notes', lines: [] },
+  audio: { name: 'mr.mp3', offset: 0, volume: 0.8 },
+});
+
+test('undo of a note edit keeps lyrics and audio offset typed afterwards', () => {
+  const d = songDraft();
+  const snap = ed.makeUndoSnapshot(d, '노트 삭제');
+  d.notes.splice(1, 1); // the operation
+  ed.sealUndoSnapshot(snap, d);
+  // later, without their own undo step
+  d.lyrics.text = '가나다라 마바사';
+  d.audio.offset = -1.25;
+  d.title = '내 노래';
+  ed.applyUndoSnapshot(d, snap);
+  assert.equal(d.notes.length, 2);
+  assert.equal(d.lyrics.text, '가나다라 마바사');
+  assert.equal(d.audio.offset, -1.25);
+  assert.equal(d.title, '내 노래');
+});
+
+test('undo of an import restores what it changed, but keeps a title typed after it', () => {
+  const d = songDraft();
+  const snap = ed.makeUndoSnapshot(d, '악보 파일 가져오기', { basics: true, lyrics: true });
+  d.notes = [{ t: 0, d: 0.5, m: 67 }];
+  d.bpm = 90;
+  d.beatsPerBar = 3;
+  d.title = '가져온 제목';
+  d.artist = '작곡가';
+  d.lyrics = { text: '라라', source: 'notes', lines: [] };
+  ed.sealUndoSnapshot(snap, d);
+  assert.deepEqual(Object.keys(snap.basics).sort(), ['artist', 'beatsPerBar', 'bpm', 'title']);
+  d.title = '직접 고친 제목'; // typed after the import
+  ed.applyUndoSnapshot(d, snap);
+  assert.deepEqual(d.notes.map((n) => n.m), [60, 62]);
+  assert.equal(d.bpm, 100);
+  assert.equal(d.beatsPerBar, 4);
+  assert.equal(d.lyrics.text, '가나');
+  assert.equal(d.title, '직접 고친 제목');
+  assert.equal(d.artist, ''); // untouched since the import → restored
+  assert.equal(d.offset, 0);
+});
+
+test('undo snapshot drops fields the operation did not change (trim with note-based lyrics)', () => {
+  const d = songDraft();
+  d.notes = [{ t: 2, d: 1, m: 60 }];
+  const snap = ed.makeUndoSnapshot(d, '앞 공백 제거', { basics: true, lyrics: true, audio: true });
+  const res = ed.trimLeadingSilence(d);
+  d.notes = res.notes;
+  d.offset = res.offset;
+  d.audio = res.audio;
+  d.lyrics = res.lyrics; // notes-based lyrics are returned as-is
+  ed.sealUndoSnapshot(snap, d);
+  assert.equal(snap.lyrics, null);
+  assert.equal(snap.audioOffset, 0);
+  d.lyrics.text = '새로 쓴 가사';
+  ed.applyUndoSnapshot(d, snap);
+  assert.equal(d.notes[0].t, 2);
+  assert.equal(d.offset, 0);
+  assert.equal(d.audio.offset, 0);
+  assert.equal(d.lyrics.text, '새로 쓴 가사');
+});
+
+test('an unsealed snapshot restores everything it captured', () => {
+  const d = songDraft();
+  const snap = ed.makeUndoSnapshot(d, 'x', { basics: true, lyrics: true, audio: true });
+  d.title = 'changed';
+  d.lyrics = { text: 'changed', source: 'notes', lines: [] };
+  d.audio.offset = 3;
+  ed.applyUndoSnapshot(d, snap);
+  assert.equal(d.title, '');
+  assert.equal(d.lyrics.text, '가나');
+  assert.equal(d.audio.offset, 0);
+  assert.equal(ed.applyUndoSnapshot(d, null), d);
+});
+
+// --- LRC lyrics follow the backing audio --------------------------------------------
+
+const lrcLines = () => [
+  { syllables: [{ text: '하', t: 5, d: 0.5 }, { text: '나', t: 5.5, d: 0.5 }] },
+  { syllables: [{ text: '둘', t: 8, d: 1 }] },
+];
+
+test('LRC times are audio time: imported lines move by the audio offset, exported lines move back', () => {
+  const song = ed.lrcLinesToSongTime(lrcLines(), -5);
+  assert.deepEqual(song.flatMap((l) => l.syllables.map((y) => y.t)), [0, 0.5, 3]);
+  assert.deepEqual(song[0].syllables.map((y) => y.d), [0.5, 0.5]);
+  const back = ed.songLinesToLrcTime(song, -5);
+  assert.deepEqual(back, lrcLines());
+  // no audio offset → unchanged
+  const same = lrcLines();
+  assert.equal(ed.lrcLinesToSongTime(same, 0), same);
+  assert.equal(ed.songLinesToLrcTime(same, undefined), same);
+  // exported times never go below 0
+  assert.equal(ed.songLinesToLrcTime([{ syllables: [{ text: 'a', t: 0.2, d: 0.1 }] }], 1)[0].syllables[0].t, 0);
+});
+
+test('changing the audio offset moves LRC lyrics with it (not note-based lyrics)', () => {
+  const d = {
+    notes: [{ t: 0, d: 1, m: 60 }],
+    audio: { name: 'mr.mp3', offset: 0, volume: 1 },
+    lyrics: { text: '하나 둘', source: 'lrc', lines: lrcLines() },
+  };
+  // 「첫 음에서 탭해서 맞추기」: audio intro of 5 s → offset −5
+  assert.equal(ed.setDraftAudioOffset(d, -5), -5);
+  assert.equal(d.audio.offset, -5);
+  assert.deepEqual(d.lyrics.lines.flatMap((l) => l.syllables.map((y) => y.t)), [0, 0.5, 3]);
+  assert.equal(d.notes[0].t, 0);
+  // fine tuning +0.01
+  assert.equal(ed.setDraftAudioOffset(d, -4.99), 0.01);
+  assert.equal(d.lyrics.lines[0].syllables[0].t, 0.01);
+  assert.equal(ed.setDraftAudioOffset(d, -4.99), 0);
+
+  const n = { audio: { offset: 0 }, lyrics: { text: '가', source: 'notes', lines: [] } };
+  const before = n.lyrics;
+  ed.setDraftAudioOffset(n, 2);
+  assert.equal(n.lyrics, before);
+  assert.equal(n.audio.offset, 2);
+  assert.equal(ed.setDraftAudioOffset({ audio: null, lyrics: before }, 1), 0);
+  assert.equal(ed.setDraftAudioOffset(n, NaN), 0);
+  assert.equal(ed.shiftLyricTimes(before, 3), before);
+});
+
+const lyricTimes = (d) => d.lyrics.lines.flatMap((l) => l.syllables.map((y) => y.t));
+const lrcDraft = (offset = 0) => ({
+  ...songDraft(),
+  audio: { name: 'mr.mp3', offset, volume: 0.8 },
+  lyrics: { text: '하나 둘', source: 'lrc', lines: ed.lrcLinesToSongTime(lrcLines(), offset) },
+});
+
+test('undo of an LRC re-import after an offset change puts the old lines at the current offset', () => {
+  const d = lrcDraft(0); // LRC A placed at offset 0 → 5, 5.5, 8
+  const snap = ed.makeUndoSnapshot(d, 'LRC 가져오기', { basics: true, lyrics: true });
+  assert.equal(snap.lyricsAudioOffset, 0);
+  // LRC B imported (its own audio times 7)
+  d.lyrics = { text: 'B', source: 'lrc', lines: ed.lrcLinesToSongTime([{ syllables: [{ text: 'B', t: 7, d: 1 }] }], ed.lrcAudioOffset(d)) };
+  ed.sealUndoSnapshot(snap, d);
+  // the offset is typed afterwards (no undo step of its own) → B moves with it
+  ed.setDraftAudioOffset(d, -5);
+  assert.deepEqual(lyricTimes(d), [2]);
+  ed.applyUndoSnapshot(d, snap);
+  assert.equal(d.lyrics.lines[0].syllables[0].text, '하');
+  assert.deepEqual(lyricTimes(d), [0, 0.5, 3], 'A follows the offset now in effect (−5), not the one it was placed with');
+  assert.equal(d.audio.offset, -5);
+  // durations are untouched
+  assert.deepEqual(d.lyrics.lines[0].syllables.map((y) => y.d), [0.5, 0.5]);
+});
+
+test('undo of switching to note-based lyrics after an offset change restores LRC lines at the current offset', () => {
+  const d = lrcDraft(-2); // 3, 3.5, 6
+  const snap = ed.makeUndoSnapshot(d, '노트 기준으로 바꾸기', { lyrics: true });
+  d.lyrics = { text: '하나 둘', source: 'notes', lines: [] };
+  ed.sealUndoSnapshot(snap, d);
+  ed.setDraftAudioOffset(d, -4.5); // note-based lyrics do not move
+  ed.applyUndoSnapshot(d, snap);
+  assert.equal(d.lyrics.source, 'lrc');
+  assert.deepEqual(lyricTimes(d), [0.5, 1, 3.5]);
+});
+
+test('undo that restores the audio offset together with the lyrics does not shift them again', () => {
+  const d = lrcDraft(0);
+  const snap = ed.makeUndoSnapshot(d, '음원 오프셋 맞추기', { audio: true, lyrics: true });
+  ed.setDraftAudioOffset(d, -5);
+  ed.sealUndoSnapshot(snap, d);
+  ed.setDraftAudioOffset(d, -4.9); // ± fine tuning afterwards
+  ed.applyUndoSnapshot(d, snap);
+  assert.equal(d.audio.offset, 0);
+  assert.deepEqual(lyricTimes(d), [5, 5.5, 8]);
+
+  // trim moves notes, audio offset and LRC lines together; undo restores all of them as they were
+  const t = lrcDraft(-1);
+  t.notes = [{ t: 2, d: 1, m: 60 }];
+  const trimSnap = ed.makeUndoSnapshot(t, '앞 공백 제거', { basics: true, lyrics: true, audio: true });
+  const res = ed.trimLeadingSilence(t);
+  Object.assign(t, { notes: res.notes, offset: res.offset, audio: res.audio, lyrics: res.lyrics });
+  ed.sealUndoSnapshot(trimSnap, t);
+  ed.applyUndoSnapshot(t, trimSnap);
+  assert.equal(t.audio.offset, -1);
+  assert.deepEqual(lyricTimes(t), [4, 4.5, 7]);
+});
+
+test('undo after the backing audio was removed puts LRC lines back on LRC file time', () => {
+  const d = lrcDraft(-5); // 0, 0.5, 3
+  const snap = ed.makeUndoSnapshot(d, '노트 기준으로 바꾸기', { lyrics: true });
+  d.lyrics = { text: '하나 둘', source: 'notes', lines: [] };
+  ed.sealUndoSnapshot(snap, d);
+  ed.removeDraftAudio(d);
+  ed.applyUndoSnapshot(d, snap);
+  assert.deepEqual(lyricTimes(d), [5, 5.5, 8]);
+  // snapshots kept from before this change (no lyricsAudioOffset) restore the lines as stored
+  const old = { label: 'x', notes: d.notes, lyrics: { text: 'a', source: 'lrc', lines: lrcLines() } };
+  const e = lrcDraft(-3);
+  ed.applyUndoSnapshot(e, old);
+  assert.deepEqual(lyricTimes(e), [5, 5.5, 8]);
+});
+
+test('removing the backing audio returns LRC lines to file time, so re-adding audio and its offset lines up', () => {
+  const d = lrcDraft(-5);
+  assert.deepEqual(lyricTimes(d), [0, 0.5, 3]);
+  assert.equal(ed.removeDraftAudio(d), 5);
+  assert.equal(d.audio, null);
+  assert.deepEqual(lyricTimes(d), [5, 5.5, 8]);
+  assert.equal(ed.lrcAudioOffset(d), 0);
+  // exported LRC (no audio) = the original file times
+  assert.deepEqual(ed.songLinesToLrcTime(d.lyrics.lines, ed.lrcAudioOffset(d)), lrcLines());
+  // pick the recording again (starts at offset 0) and enter the real offset again
+  d.audio = ed.pickedAudioInfo(d.audio, 'mr.mp3');
+  assert.equal(d.audio.offset, 0);
+  ed.setDraftAudioOffset(d, -5);
+  assert.deepEqual(lyricTimes(d), [0, 0.5, 3], 'not shifted twice');
+  assert.equal(ed.removeDraftAudio({ audio: null, lyrics: d.lyrics }), 0);
+  // note-based lyrics never move
+  const n = { ...songDraft(), audio: { name: 'a', offset: 2, volume: 1 } };
+  const before = n.lyrics;
+  ed.removeDraftAudio(n);
+  assert.equal(n.lyrics, before);
+});
+
+test('JSON import → pick the audio again → enter the offset again keeps LRC lyrics where they belong', () => {
+  // exported on tablet A: audio offset −5, LRC lines already in song time
+  const exported = lrcDraft(-5);
+  // imported on tablet B into a draft without the audio file
+  const res = ed.importedAudioState(exported, null, false);
+  assert.deepEqual(res.audio, { name: 'mr.mp3', offset: -5, volume: 0.8 });
+  assert.equal(res.missing, true);
+  assert.notEqual(res.audio, exported.audio);
+  const d = { ...songDraft(), audio: res.audio, lyrics: res.lyrics };
+  // exporting LRC before the file is back still gives the file times
+  assert.deepEqual(ed.songLinesToLrcTime(d.lyrics.lines, ed.lrcAudioOffset(d)), lrcLines());
+  // 「다시 선택」 inherits the offset → typing it again (or tap-align landing on it) moves nothing
+  d.audio = ed.pickedAudioInfo(d.audio, 'mr-copy.mp3');
+  assert.deepEqual(d.audio, { name: 'mr-copy.mp3', offset: -5, volume: 0.8 });
+  assert.equal(ed.setDraftAudioOffset(d, -5), 0);
+  assert.deepEqual(lyricTimes(d), [0, 0.5, 3]);
+  ed.setDraftAudioOffset(d, -4.8);
+  assert.deepEqual(lyricTimes(d), [0.2, 0.7, 3.2]);
+  // a draft whose stored audio file was missing too takes the imported audio info
+  const missing = ed.importedAudioState(exported, { name: 'old.mp3', offset: 1, volume: 1 }, false);
+  assert.equal(missing.audio.name, 'mr.mp3');
+  assert.equal(missing.audio.offset, -5);
+});
+
+test('JSON import: with an audio file the imported offset applies to it; a JSON without audio follows the current offset', () => {
+  const exported = lrcDraft(-5);
+  const cur = { name: 'mine.mp3', offset: 1, volume: 0.5 };
+  const withFile = ed.importedAudioState(exported, cur, true);
+  assert.deepEqual(withFile.audio, { name: 'mine.mp3', offset: -5, volume: 0.8 });
+  assert.equal(withFile.missing, false);
+  assert.equal(withFile.lyrics, exported.lyrics);
+  // the JSON has no audio → its LRC lines are file time (offset 0); the current audio keeps its offset (+1)
+  const plain = { ...songDraft(), audio: null, lyrics: { text: '하나 둘', source: 'lrc', lines: lrcLines() } };
+  const kept = ed.importedAudioState(plain, cur, true);
+  assert.equal(kept.audio, cur);
+  assert.equal(kept.missing, false);
+  assert.deepEqual(kept.lyrics.lines.flatMap((l) => l.syllables.map((y) => y.t)), [6, 6.5, 9]);
+  assert.equal(ed.importedAudioState(plain, cur, false).missing, true);
+  const none = ed.importedAudioState(plain, null, false);
+  assert.equal(none.audio, null);
+  assert.equal(none.missing, false);
+  assert.equal(none.lyrics, plain.lyrics);
+});
+
+// --- MIDI time signatures -------------------------------------------------------
+
+test('midiBeatGrid: bar length matches the time signature (x/8, x/2 like MusicXML)', () => {
+  const barSec = (g) => (60 / g.bpm) * g.beatsPerBar;
+  const quarterBar = (ts, q) => (60 / q) * (ts.num * 4 / ts.den);
+  const cases = [
+    [{ num: 4, den: 4 }, 120, { bpm: 120, beatsPerBar: 4, unit: 4 }],
+    [{ num: 3, den: 4 }, 100, { bpm: 100, beatsPerBar: 3, unit: 4 }],
+    [{ num: 6, den: 8 }, 90, { bpm: 180, beatsPerBar: 6, unit: 8 }],
+    [{ num: 9, den: 8 }, 60, { bpm: 120, beatsPerBar: 9, unit: 8 }],
+    [{ num: 2, den: 2 }, 120, { bpm: 60, beatsPerBar: 2, unit: 2 }],
+    [{ num: 6, den: 8 }, 200, { bpm: 200, beatsPerBar: 3, unit: 4 }], // 8th BPM 400 is out of range → quarter beats
+  ];
+  for (const [ts, q, want] of cases) {
+    const g = ed.midiBeatGrid(ts, q);
+    assert.deepEqual(g, want, `${ts.num}/${ts.den} ♩=${q}`);
+    assert.ok(Math.abs(barSec(g) - quarterBar(ts, q)) < 1e-9, `${ts.num}/${ts.den} bar length`);
+  }
+  assert.deepEqual(ed.midiBeatGrid(null, NaN), { bpm: 120, beatsPerBar: 4, unit: 4 });
+  assert.equal(ed.midiBeatGrid({ num: 4, den: 4 }, 500).bpm, 300); // clamped to the app range
+});
+
+// --- step entry persistence ---------------------------------------------------------
+
+test('stepMergeNotes: append keeps existing notes (copied), replace uses only the entries', () => {
+  const existing = [{ t: 0, d: 0.5, m: 60 }];
+  const entries = [{ kind: 'note', m: 62, ticks: ed.STEP_TPB }, { kind: 'rest', ticks: ed.STEP_TPB }, { kind: 'note', m: 64, ticks: ed.STEP_TPB }];
+  const app = ed.stepMergeNotes(existing, entries, { bpm: 120, origin: 0, startTick: ed.STEP_TPB, append: true });
+  assert.deepEqual(app.added.map((n) => [n.t, n.m]), [[0.5, 62], [1.5, 64]]);
+  assert.deepEqual(app.notes.map((n) => [n.t, n.m]), [[0, 60], [0.5, 62], [1.5, 64]]);
+  assert.notEqual(app.notes[0], existing[0]);
+  app.notes[0].m = 1;
+  assert.equal(existing[0].m, 60, 'existing notes are not mutated');
+  const rep = ed.stepMergeNotes(existing, entries, { bpm: 120 });
+  assert.deepEqual(rep.notes.map((n) => [n.t, n.m]), [[0, 62], [1, 64]]);
+  assert.deepEqual(ed.stepMergeNotes(existing, [], { append: true }).added, []);
 });
 
 test('screen module exports mount/unmount/onBack', () => {

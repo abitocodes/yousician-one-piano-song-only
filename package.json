@@ -6,6 +6,8 @@
   "type": "module",
   "scripts": {
     "test": "node --test",
+    "stamp": "node tools/stamp-version.mjs",
+    "stamp:check": "node tools/stamp-version.mjs --check",
     "serve": "python -m http.server 8080"
   }
 }

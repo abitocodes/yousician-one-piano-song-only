@@ -86,6 +86,28 @@ test('notesToNotation: staccato notes keep their positions; chords → highest',
   assert.equal(notesToNotation(null), '');
 });
 
+test('notesToNotation: onsets that round to the same 1/4 beat do not delay the following notes', () => {
+  // bpm 100 → 0.6 s per beat. D4 starts 50 ms after a long C4, so both round to beat 0.
+  const notes = [
+    { t: 0, d: 0.6, m: 60 },
+    { t: 0.05, d: 0.55, m: 62 },
+    { t: 0.6, d: 0.6, m: 64 },
+    { t: 1.2, d: 0.6, m: 65 },
+  ];
+  const text = notesToNotation(notes, { bpm: 100 });
+  assert.equal(text, 'C4:1/4 D4:3/4 E4 F4');
+  const back = parseNotation(text, { bpm: 100 }).notes;
+  assert.deepEqual(back.map((n) => n.t), [0, 0.15, 0.6, 1.2]);
+
+  // rolled chord (overlapping long notes 40 ms apart) followed by quarter notes
+  const rolled = [
+    { t: 0, d: 1.2, m: 60 }, { t: 0.04, d: 1.2, m: 64 }, { t: 0.08, d: 1.2, m: 67 },
+    { t: 1.2, d: 0.6, m: 69 }, { t: 1.8, d: 0.6, m: 71 }, { t: 2.4, d: 0.6, m: 72 },
+  ];
+  const out = parseNotation(notesToNotation(rolled, { bpm: 100 }), { bpm: 100 }).notes;
+  assert.deepEqual(out.slice(-3).map((n) => [n.m, n.t]), [[69, 1.2], [71, 1.8], [72, 2.4]]);
+});
+
 test('notesToNotation ↔ parseNotation round trip for grid-aligned input (bpm, offset, 3/4)', () => {
   const opts = { bpm: 84, offset: 1.25, beatsPerBar: 3 };
   const src = parseNotation('도4 레4 미4 | 파4:2 솔#4:1/2 R:1/2 | 라4:3 | R:1 시4:1/4 C5:3/4 B4 | A4:6', opts).notes;

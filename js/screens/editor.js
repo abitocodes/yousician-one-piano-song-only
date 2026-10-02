@@ -15,6 +15,7 @@ import { confirmDialog, modal, downloadFile, pickFile, syncRange } from '../ui/d
 import { micErrorMessage } from './calibrate.js';
 
 const RECOVERY_KEY = 'pk.editorRecovery';
+const RECOVERY_LIMIT = 5; // 곡별 복구본을 최근 몇 개까지 남길지 (localStorage 용량 보호)
 const UNDO_LIMIT = 40;
 const BEATS_OPTIONS = [2, 3, 4, 5, 6, 7, 8, 9, 12];
 const ZOOMS = [1, 2, 4, 8];
@@ -183,6 +184,200 @@ export function trimLeadingSilence(song) {
   };
 }
 
+// --- LRC 가사 시간 ↔ 반주 음원 -------------------------------------------------
+// LRC 파일의 시간은 반주 음원(녹음) 기준이다. 곡 시간 = 음원 시간 + 음원 오프셋 (backing.js와 같은 정의).
+
+/** LRC 가사의 모든 음절을 delta초 옮긴다 (LRC가 아니거나 0이면 그대로). */
+export function shiftLyricTimes(lyrics, delta) {
+  if (!lyrics || lyrics.source !== 'lrc' || !Number.isFinite(delta) || Math.abs(delta) < 0.0005) return lyrics;
+  return mapLyricTimes(lyrics, (y) => ({ t: round3(y.t + delta) }));
+}
+
+/** 가져온 LRC 줄(음원 시간) → 곡 시간 줄. */
+export function lrcLinesToSongTime(lines, audioOffset = 0) {
+  const ao = Number.isFinite(audioOffset) ? audioOffset : 0;
+  if (Math.abs(ao) < 0.0005) return lines;
+  return mapLyricTimes({ lines }, (y) => ({ t: round3(y.t + ao) })).lines;
+}
+
+/** 곡 시간 줄 → LRC로 내보낼 줄(음원 시간, 0초 미만은 0). */
+export function songLinesToLrcTime(lines, audioOffset = 0) {
+  const ao = Number.isFinite(audioOffset) ? audioOffset : 0;
+  if (Math.abs(ao) < 0.0005) return lines;
+  return mapLyricTimes({ lines }, (y) => ({ t: round3(Math.max(0, y.t - ao)) })).lines;
+}
+
+/** LRC 가사가 맞춰져 있는 음원 오프셋: 반주 음원이 있으면 그 오프셋, 없으면 0 (LRC 파일 시간 그대로). */
+export function lrcAudioOffset(draft) {
+  const a = draft && draft.audio;
+  return a && Number.isFinite(a.offset) ? a.offset : 0;
+}
+
+/**
+ * 반주 음원 오프셋을 바꾼다 (draft를 직접 바꾼다). LRC 가사는 음원 기준이라 같은 만큼 함께 옮긴다.
+ * 바뀐 양(초)을 돌려준다. 음원이 없거나 값이 잘못되면 0.
+ */
+export function setDraftAudioOffset(draft, value) {
+  const a = draft && draft.audio;
+  if (!a || !Number.isFinite(value)) return 0;
+  const prev = Number.isFinite(a.offset) ? a.offset : 0;
+  a.offset = round3(clamp(value, -3600, 3600));
+  const delta = round3(a.offset - prev);
+  if (delta) draft.lyrics = shiftLyricTimes(draft.lyrics, delta);
+  return delta;
+}
+
+/**
+ * 반주 음원을 뺀다 (draft를 직접 바꾼다). 음원이 없으면 LRC 가사는 오프셋 0 기준이므로,
+ * 먼저 오프셋을 0으로 돌려 LRC 가사를 LRC 파일 시간으로 되돌린다 (나중에 음원을 다시 넣고
+ * 오프셋을 맞춰도 가사가 두 번 옮겨지지 않는다). 가사를 옮긴 양(초)을 돌려준다.
+ */
+export function removeDraftAudio(draft) {
+  if (!draft || !draft.audio) return 0;
+  const delta = setDraftAudioOffset(draft, 0);
+  draft.audio = null;
+  return delta;
+}
+
+/**
+ * 새로 고른 음원 파일의 음원 정보. 오프셋·음량은 지금 음원 정보(교체, 또는 파일을 찾지 못한 음원)에서 이어받는다:
+ * LRC 가사가 이미 그 오프셋만큼 옮겨져 있으므로 오프셋을 0으로 되돌리면 안 된다.
+ */
+export function pickedAudioInfo(prev, name) {
+  return {
+    name: name || '음원',
+    offset: prev && Number.isFinite(prev.offset) ? prev.offset : 0,
+    volume: prev && Number.isFinite(prev.volume) ? prev.volume : 0.8,
+  };
+}
+
+/**
+ * JSON 가져오기에서 음원 정보와 가사를 정한다 (음원 파일은 JSON에 들어 있지 않다).
+ * - 가져온 곡에 음원이 있고 지금 음원 파일이 있으면: 그 파일에 가져온 오프셋·음량을 쓴다.
+ * - 가져온 곡에 음원이 있는데 파일이 없으면: 음원 정보(오프셋)를 그대로 남긴다 → 음원을 다시 고르면
+ *   그 오프셋을 이어받아, LRC 가사(이미 그 오프셋만큼 옮겨져 있음)와 맞는다.
+ * - 가져온 곡에 음원이 없으면: 지금 음원을 그대로 두고, LRC 가사(오프셋 0 기준)를 지금 오프셋만큼 옮긴다.
+ * 돌려줌 { audio, lyrics, missing } (missing: 음원 정보는 있는데 파일이 없음).
+ */
+export function importedAudioState(song, curAudio, hasFile) {
+  const cur = curAudio || null;
+  if (song && song.audio) {
+    if (hasFile && cur) {
+      return { audio: { ...cur, offset: song.audio.offset, volume: song.audio.volume }, lyrics: song.lyrics, missing: false };
+    }
+    return { audio: { ...song.audio }, lyrics: song.lyrics, missing: true };
+  }
+  const lyrics = song ? song.lyrics : null;
+  return { audio: cur, lyrics: shiftLyricTimes(lyrics, lrcAudioOffset({ audio: cur })), missing: Boolean(cur && !hasFile) };
+}
+
+// --- MIDI 박자 ---------------------------------------------------------------
+
+/**
+ * MIDI 박자표 + 4분음표 BPM → 앱의 박 격자 { bpm, beatsPerBar, unit } (MusicXML 가져오기와 같은 규칙).
+ * 박은 박자표 아래 숫자의 음표(6/8 → 8분음표)지만, 그 BPM이 30~300을 벗어나고 4분음표 박이 정수로 떨어지면 4분음표.
+ */
+export function midiBeatGrid(ts, quarterBpm) {
+  const num = Math.round(Number(ts && ts.num)) || 4;
+  const den = Math.round(Number(ts && ts.den)) || 4;
+  const q = Number(quarterBpm) > 0 ? Number(quarterBpm) : 120;
+  let unit = num >= 1 && num <= 16 ? den : 4;
+  let perBar = unit === den ? num : Math.max(1, Math.round((num * 4) / den));
+  let bpm = (q * unit) / 4;
+  if ((bpm < 30 || bpm > 300) && unit !== 4) {
+    const qb = (num * 4) / den;
+    if (Number.isInteger(qb) && qb >= 1 && qb <= 16 && q >= 30 && q <= 300) {
+      unit = 4;
+      perBar = qb;
+      bpm = q;
+    }
+  }
+  return {
+    bpm: clamp(Math.round(bpm * 100) / 100, 30, 300),
+    beatsPerBar: clamp(Math.round(perBar), 1, 16),
+    unit,
+  };
+}
+
+// --- 되돌리기 스냅숏 -----------------------------------------------------------
+
+const BASIC_FIELDS = ['title', 'artist', 'description', 'bpm', 'beatsPerBar', 'offset'];
+const TEXT_BASICS = new Set(['title', 'artist', 'description']);
+
+function pickBasics(d) {
+  const o = {};
+  for (const k of BASIC_FIELDS) o[k] = d[k];
+  return o;
+}
+
+/**
+ * 되돌리기 스냅숏. 노트는 항상 담고, 가사·음원 오프셋·기본 정보는 그 작업이 바꿀 수 있을 때만 담는다.
+ * 담지 않은 칸은 되돌릴 때 건드리지 않으므로, 그 뒤에 입력한 가사·오프셋·제목이 사라지지 않는다.
+ * 가사를 담을 때는 그때의 음원 오프셋(lyricsAudioOffset)도 적어 둔다: LRC 가사는 음원 기준이라
+ * 그 뒤에 오프셋만 바꿨다면 되돌린 가사도 지금 오프셋에 맞게 옮겨야 한다.
+ */
+export function makeUndoSnapshot(draft, label, { basics = false, lyrics = false, audio = false } = {}) {
+  return {
+    label,
+    notes: copyNotes(draft.notes || []),
+    lyrics: lyrics ? copyLyrics(draft.lyrics) : null,
+    lyricsAudioOffset: lyrics ? lrcAudioOffset(draft) : null,
+    audioOffset: audio && draft.audio && Number.isFinite(draft.audio.offset) ? draft.audio.offset : null,
+    basics: basics ? pickBasics(draft) : null,
+    basicsAfter: null,
+    sealed: false,
+  };
+}
+
+/** 작업이 끝난 직후에 부른다: 작업이 실제로 바꾼 칸만 남기고, 기본 정보는 작업 뒤의 값도 기록한다. */
+export function sealUndoSnapshot(snap, draft) {
+  if (!snap || snap.sealed || !draft) return snap;
+  snap.sealed = true;
+  if (snap.lyrics && JSON.stringify(copyLyrics(draft.lyrics)) === JSON.stringify(snap.lyrics)) {
+    snap.lyrics = null;
+    snap.lyricsAudioOffset = null;
+  }
+  if (snap.audioOffset != null && !(draft.audio && draft.audio.offset !== snap.audioOffset)) snap.audioOffset = null;
+  if (snap.basics) {
+    const before = {};
+    const after = {};
+    for (const k of BASIC_FIELDS) {
+      if (draft[k] === snap.basics[k]) continue;
+      before[k] = snap.basics[k];
+      after[k] = draft[k];
+    }
+    const changed = Object.keys(before).length > 0;
+    snap.basics = changed ? before : null;
+    snap.basicsAfter = changed ? after : null;
+  }
+  return snap;
+}
+
+/**
+ * 스냅숏을 초안에 되돌린다 (draft를 직접 바꾼다). 노트·작업이 바꾼 가사/음원 오프셋/BPM·박자·첫 박은 작업 전으로.
+ * 되돌린 LRC 가사는 되돌린 뒤의 음원 오프셋에 맞춘다 (스냅숏 뒤에 오프셋만 바꿨으면 그만큼 옮긴다).
+ * 제목·아티스트·설명은 작업이 바꾼 값 그대로일 때만 되돌린다 (그 뒤에 직접 고친 글은 남긴다).
+ */
+export function applyUndoSnapshot(draft, snap) {
+  if (!draft || !snap) return draft;
+  if (Array.isArray(snap.notes)) draft.notes = snap.notes;
+  if (draft.audio && Number.isFinite(snap.audioOffset)) draft.audio.offset = snap.audioOffset;
+  if (snap.lyrics) {
+    const at = snap.lyricsAudioOffset;
+    // 예전 스냅숏(미리듣기에서 돌아온 되돌리기 목록)에는 오프셋이 없다 → 그대로
+    draft.lyrics = Number.isFinite(at) ? shiftLyricTimes(snap.lyrics, round3(lrcAudioOffset(draft) - at)) : snap.lyrics;
+  }
+  if (snap.basics) {
+    const after = snap.basicsAfter;
+    for (const k of BASIC_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(snap.basics, k)) continue;
+      if (after && TEXT_BASICS.has(k) && Object.prototype.hasOwnProperty.call(after, k) && draft[k] !== after[k]) continue;
+      draft[k] = snap.basics[k];
+    }
+  }
+  return draft;
+}
+
 // --- 악보 파일 판별 -----------------------------------------------------------
 
 function asBytes(data) {
@@ -327,6 +522,16 @@ export function stepEntriesToNotes(entries, { bpm = 100, origin = 0, startTick =
   return stepItems(entries, startTick)
     .filter((it) => !it.rest)
     .map((it) => ({ t: round3(base + it.tick * spt), d: Math.max(0.01, round3(it.ticks * spt)), m: it.m, v: velocity }));
+}
+
+/**
+ * 스텝 입력을 끝냈을 때의 노트 목록: 이어서 입력(append)이면 기존 노트 뒤에 붙이고, 아니면 입력한 음으로 바꾼다.
+ * 기존 노트 배열은 바꾸지 않는다.
+ */
+export function stepMergeNotes(existing, entries, { bpm = 100, origin = 0, startTick = 0, append = false } = {}) {
+  const added = stepEntriesToNotes(entries, { bpm, origin, startTick });
+  const base = append ? (existing || []).map((n) => ({ ...n })) : [];
+  return { added, notes: sortNotes([...base, ...added]) };
 }
 
 /** 입력 항목 → 텍스트 입력 문법 ('도4 레4:1/2 R | 미4:2'). 마디 경계에서 시작하는 항목 앞에 ' | '. */
@@ -507,34 +712,242 @@ function copyLyrics(lyrics) {
 // Recovery (unsaved draft survives tab kills / accidental navigation)
 // ---------------------------------------------------------------------------
 
-function readRecovery() {
+// 저장 형식: { v: 2, slots: { [칸]: { id, isNew, savedAt, draft } } }. 칸 이름은 보통 곡 id라서
+// 다른 곡을 편집해도 서로 덮어쓰지 않는다. 예전 형식(한 칸: { id, isNew, savedAt, draft })은 읽을 때 옮긴다.
+
+function recoveryEntry(e) {
+  if (!e || typeof e !== 'object' || !e.draft || typeof e.draft !== 'object' || Array.isArray(e.draft)) return null;
+  const rawId = e.id != null && e.id !== '' ? e.id : e.draft.id;
+  if (rawId == null || rawId === '') return null;
+  const savedAt = Number(e.savedAt);
+  const out = { id: String(rawId), isNew: e.isNew === true, savedAt: Number.isFinite(savedAt) ? savedAt : 0, draft: e.draft };
+  if (e.kept === true) out.kept = true; // 복구 창을 그냥 닫아 남겨 두기로 한 복구본
+  return out;
+}
+
+function isLegacyRecovery(v) {
+  return Boolean(v && typeof v === 'object' && v.v !== 2 && v.draft && typeof v.draft === 'object');
+}
+
+/** 저장된 값(문자열 또는 JSON 값) → { [칸]: entry }. 예전 한 칸 형식은 그 곡 id 칸으로 옮긴다. 잘못된 값은 버린다. */
+export function parseRecoveryStore(raw) {
+  let v = raw;
+  if (typeof raw === 'string') {
+    try { v = JSON.parse(raw); } catch { return {}; }
+  }
+  const out = {};
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return out;
+  if (isLegacyRecovery(v)) {
+    const e = recoveryEntry(v);
+    if (e) out[e.id] = e;
+    return out;
+  }
+  const slots = v.slots && typeof v.slots === 'object' && !Array.isArray(v.slots) ? v.slots : {};
+  for (const key of Object.keys(slots)) {
+    const e = recoveryEntry(slots[key]);
+    if (e) out[key] = e;
+  }
+  return out;
+}
+
+export function serializeRecoveryStore(slots) {
+  return JSON.stringify({ v: 2, slots: slots || {} });
+}
+
+/** slot 칸에 entry를 넣는다. 넣은 칸은 항상 남기고 나머지는 최근 것부터 모두 limit개까지만. */
+export function recoveryPut(slots, slot, entry, limit = RECOVERY_LIMIT) {
+  const next = { ...(slots || {}), [slot]: entry };
+  const others = Object.keys(next).filter((k) => k !== slot)
+    .sort((a, b) => (next[b].savedAt || 0) - (next[a].savedAt || 0));
+  const keep = new Set([slot, ...others.slice(0, Math.max(0, limit - 1))]);
+  const out = {};
+  for (const k of Object.keys(next)) if (keep.has(k)) out[k] = next[k];
+  return out;
+}
+
+/** pred(entry, slot)가 참인 칸을 뺀 새 객체. */
+export function recoveryDrop(slots, pred) {
+  const out = {};
+  for (const [k, e] of Object.entries(slots || {})) if (!pred(e, k)) out[k] = e;
+  return out;
+}
+
+/**
+ * 곡을 열 때 물어볼 복구본들 (최근 것부터 [{ slot, entry }]).
+ * 저장된 곡(id): 그 곡의 복구본 중 마지막 저장(updatedAt)보다 나중 것, 그리고 남겨 두기로 한 것(kept, 저장보다 이전이어도).
+ * 새 곡(id 없음): 한 번도 저장하지 않은 새 곡 복구본.
+ */
+export function recoveryCandidates(slots, { id = null, updatedAt = 0 } = {}) {
+  const since = Number(updatedAt) || 0;
+  const list = [];
+  for (const [slot, entry] of Object.entries(slots || {})) {
+    const ok = id != null ? entry.id === String(id) && (entry.savedAt > since || entry.kept === true) : entry.isNew === true;
+    if (ok) list.push({ slot, entry });
+  }
+  return list.sort((a, b) => b.entry.savedAt - a.entry.savedAt);
+}
+
+/** 곡을 열 때 버릴 복구본: 그 곡의 마지막 저장보다 오래된 것 (남겨 두기로 한 것은 빼고). */
+export function recoveryPrune(slots, id, updatedAt) {
+  const key = String(id);
+  const since = Number(updatedAt) || 0;
+  return recoveryDrop(slots, (e) => e.id === key && e.savedAt <= since && e.kept !== true);
+}
+
+/** 복구 창을 그냥 닫았을 때: 보여준 복구본들을 남겨 두기로 표시한다 (저장 뒤에도 다시 물어본다). */
+export function recoveryKeep(slots, keys) {
+  const keep = new Set(keys || []);
+  const out = {};
+  for (const [k, e] of Object.entries(slots || {})) out[k] = keep.has(k) && e.kept !== true ? { ...e, kept: true } : e;
+  return out;
+}
+
+/**
+ * 저장한 뒤 지울 복구본: 이 편집 화면의 칸(방금 저장한 내용), 그리고 저장을 시작하기 전에 쓴 같은 곡의 복구본.
+ * 남겨 두기로 한 복구본(kept)과 다른 곡의 복구본은 그대로 둔다.
+ */
+export function recoveryAfterSave(slots, { id, slot = '', before = 0 } = {}) {
+  const key = String(id);
+  return recoveryDrop(slots, (e, k) => (slot !== '' && k === slot) || (e.id === key && e.kept !== true && e.savedAt <= before));
+}
+
+/**
+ * 복구 확인 창의 제목·문구·선택지. 값: 'restore:<번호>' | 'discard'. 창을 그냥 닫으면(null) 복구본을 남겨 둔다.
+ * updatedAt(마지막 저장 시각)보다 이전 복구본은 '저장본보다 이전'이라고 알려 준다.
+ */
+export function recoveryPrompt(cands, { existing = false, updatedAt = 0 } = {}) {
+  const titleOf = (e) => String((e.draft && e.draft.title) || '').trim() || '제목 없음';
+  const notesOf = (e) => (e.draft && Array.isArray(e.draft.notes) ? e.draft.notes.length : 0);
+  const older = (e) => existing && Number(updatedAt) > 0 && e.savedAt <= Number(updatedAt);
+  const later = ' 창을 닫으면 복구본을 남겨 두고 다음에 다시 물어봐요.';
+  if (cands.length === 1) {
+    const e = cands[0].entry;
+    const note = older(e) ? ' 마지막으로 저장한 곡보다 이전에 편집하던 내용이에요.' : '';
+    return {
+      title: '저장하지 않은 편집 내용이 있어요',
+      message: `${fmtDate(e.savedAt)}에 편집하던 "${titleOf(e)}" 내용을 복구할까요?${note}${later}`,
+      options: [
+        { value: 'restore:0', label: '복구하기', cls: 'primary' },
+        { value: 'discard', label: existing ? '버리고 저장된 곡 열기' : '버리고 새로 시작', cls: 'danger' },
+      ],
+    };
+  }
+  return {
+    title: '저장하지 않은 편집 내용이 있어요',
+    message: `복구할 수 있는 편집 내용이 ${cands.length}개 있어요. 복구할 것을 고르세요.${later}`,
+    options: [
+      ...cands.map((c, i) => ({
+        value: `restore:${i}`,
+        label: `"${titleOf(c.entry)}" · 노트 ${notesOf(c.entry)}개 · ${fmtDate(c.entry.savedAt)}${older(c.entry) ? ' · 저장본보다 이전' : ''}`,
+        cls: i === 0 ? 'primary' : '',
+      })),
+      { value: 'discard', label: existing ? '모두 버리고 저장된 곡 열기' : '모두 버리고 새로 시작', cls: 'danger' },
+    ],
+  };
+}
+
+/** localStorage의 복구본들. 예전 한 칸 형식이면 이 자리에서 새 형식으로 옮겨 저장한다. */
+export function readRecoveryStore() {
+  let raw = null;
   try {
-    const raw = localStorage.getItem(RECOVERY_KEY);
-    if (!raw) return null;
-    const v = JSON.parse(raw);
-    return v && typeof v === 'object' && v.draft && typeof v.draft === 'object' ? v : null;
+    raw = localStorage.getItem(RECOVERY_KEY);
   } catch {
-    return null;
+    return {};
+  }
+  if (!raw) return {};
+  let v = null;
+  try { v = JSON.parse(raw); } catch { return {}; }
+  const slots = parseRecoveryStore(v);
+  if (isLegacyRecovery(v)) writeRecoveryStore(slots); // 예전 한 칸 형식 → 곡별 칸으로 옮겨 둔다
+  return slots;
+}
+
+/** 저장 공간이 모자라면 오래된 복구본부터 버리고 다시 시도한다 (keep 칸은 끝까지 남긴다). */
+export function writeRecoveryStore(slots, keep = null) {
+  let cur = slots || {};
+  for (;;) {
+    try {
+      if (Object.keys(cur).length) localStorage.setItem(RECOVERY_KEY, serializeRecoveryStore(cur));
+      else localStorage.removeItem(RECOVERY_KEY);
+      return true;
+    } catch {
+      // 저장 공간 부족·사생활 보호 모드
+      const victim = Object.keys(cur).filter((k) => k !== keep)
+        .sort((a, b) => (cur[a].savedAt || 0) - (cur[b].savedAt || 0))[0];
+      if (victim == null) return false; // 복구 기능만 포기
+      cur = recoveryDrop(cur, (e, k) => k === victim);
+    }
   }
 }
 
-function writeRecovery(s) {
-  if (!s.draft) return;
-  try {
-    localStorage.setItem(RECOVERY_KEY, JSON.stringify({
-      id: s.draft.id, isNew: !s.stored, savedAt: Date.now(), draft: s.draft,
-    }));
-  } catch {
-    // 저장 공간 부족·사생활 보호 모드: 복구 기능만 포기
-  }
+/** 이 편집 화면이 쓰는 복구 칸 (보통 곡 id). */
+function sessionSlot(s) {
+  return s.recoverySlot || (s.draft && s.draft.id != null ? String(s.draft.id) : '');
 }
 
-function clearRecovery() {
-  try {
-    localStorage.removeItem(RECOVERY_KEY);
-  } catch {
-    // ignore
+/** 복구해 둘 초안: 「악보 보고 입력」 중이면 입력 중인 음까지 넣은 임시 초안, 아니면 저장 안 된 초안. 없으면 null. */
+function recoveryDraft(s) {
+  if (typeof s.provisional === 'function') {
+    try {
+      const p = s.provisional();
+      if (p) return p;
+    } catch (err) {
+      console.error(err);
+    }
   }
+  return s.dirty && s.draft ? s.draft : null;
+}
+
+/**
+ * 복구 칸에 쓸 항목. savedAt은 notBefore보다 나중으로 적는다: 저장하는 동안 고친 내용을 저장이 끝난 뒤에 쓸 때
+ * 방금 저장한 곡의 updatedAt보다 오래된 복구본으로 보여 다음에 열 때 버려지지 않도록.
+ */
+export function makeRecoveryEntry(draft, { isNew = false, now = Date.now(), notBefore = 0 } = {}) {
+  const savedAt = Math.max(Number(now) || 0, (Number(notBefore) || 0) + 1);
+  return { id: String(draft.id), isNew: isNew === true, savedAt, draft };
+}
+
+function writeRecovery(s, notBefore = 0) {
+  const draft = recoveryDraft(s);
+  const slot = sessionSlot(s);
+  if (!draft || !slot) return;
+  const entry = makeRecoveryEntry(draft, { isNew: !s.stored, notBefore });
+  writeRecoveryStore(recoveryPut(readRecoveryStore(), slot, entry), slot);
+}
+
+/** 이 편집 화면의 복구 칸만 지운다 (다른 곡·남겨 둔 복구본은 그대로). */
+function dropSessionRecovery(s) {
+  const slot = sessionSlot(s);
+  if (!slot) return;
+  const slots = readRecoveryStore();
+  if (slots[slot]) writeRecoveryStore(recoveryDrop(slots, (e, k) => k === slot));
+}
+
+/**
+ * 저장한 뒤: 이 편집 화면의 칸과 저장 시작 전에 쓴 같은 곡의 복구본만 지운다.
+ * 복구 창을 닫아 남겨 두기로 한 복구본은 지우지 않는다 (칸 이름도 그대로 두어 덮어쓰지 않는다).
+ */
+function clearSavedRecovery(s, id, before) {
+  if (id == null) return;
+  const slots = readRecoveryStore();
+  const next = recoveryAfterSave(slots, { id, slot: sessionSlot(s), before });
+  if (Object.keys(next).length !== Object.keys(slots).length) writeRecoveryStore(next);
+}
+
+/** 이 곡(id)의 복구본을 남겨 둔 것까지 모두 지운다: 곡을 삭제·초기화한 뒤. */
+function clearSongRecovery(s, id) {
+  s.recoverySlot = null;
+  if (id == null) return;
+  const key = String(id);
+  const slots = readRecoveryStore();
+  const next = recoveryDrop(slots, (e) => e.id === key);
+  if (Object.keys(next).length !== Object.keys(slots).length) writeRecoveryStore(next);
+}
+
+/** 남길 내용이 있으면 복구 칸에 쓰고, 없으면 이 화면의 칸을 지운다. */
+function syncRecovery(s) {
+  if (recoveryDraft(s)) writeRecovery(s);
+  else dropSessionRecovery(s);
 }
 
 function newSong() {
@@ -576,7 +989,11 @@ export async function mount(root, params = {}, app) {
     audioUrl: '',
     audioDuration: NaN,
     dirty: false,
+    rev: 0, // markDirty마다 +1 (저장하는 동안 바뀌었는지 확인)
+    audioRev: 0, // 음원 파일을 넣거나 뺄 때마다 +1
     saving: false,
+    recoverySlot: null, // 복구 칸 이름 (null이면 곡 id)
+    provisional: null, // () => 임시 초안 | null (악보 보고 입력 중)
     undo: [],
     sel: null,
     zoom: 1,
@@ -633,6 +1050,8 @@ export function unmount() {
   const s = S;
   if (!s) return;
   S = null;
+  // 창(악보 보고 입력 등)을 닫기 전에: 입력 중인 내용까지 복구 칸에 남긴다.
+  writeRecovery(s);
   s.disposed = true;
   stopRecorder(s);
   for (const m of [...s.modals]) {
@@ -651,11 +1070,10 @@ export function unmount() {
     try { s.synth.stopAll(); } catch (err) { console.error(err); }
   }
   disposeAudioEl(s);
-  if (s.dirty) writeRecovery(s);
   if (s.startedMic) {
     try {
       const input = s.app.getInput();
-      if (s.app.settings.get('inputMode') !== 'mic' && input.mode === 'mic') input.stop();
+      if (input && s.app.settings.get('inputMode') !== 'mic' && input.mode === 'mic') input.stop();
     } catch (err) {
       console.error(err);
     }
@@ -676,6 +1094,7 @@ async function load(s, params) {
     if (ZOOMS.includes(ui.zoom)) s.zoom = ui.zoom;
     if (typeof ui.templateDesc === 'string') s.templateDesc = ui.templateDesc;
     if (Array.isArray(ui.undo)) s.undo = ui.undo.slice(-UNDO_LIMIT);
+    if (typeof ui.recoverySlot === 'string' && ui.recoverySlot) s.recoverySlot = ui.recoverySlot;
   } else {
     let song = null;
     if (params.songId) {
@@ -692,30 +1111,8 @@ async function load(s, params) {
       s.draft.description = '';
     }
 
-    const rec = readRecovery();
-    if (rec) {
-      const matches = song
-        ? rec.id === s.draft.id && Number(rec.savedAt) > (Number(song.updatedAt) || 0)
-        : rec.isNew === true;
-      if (matches) {
-        // 창을 그냥 닫으면(null) 복구본을 남겨 두고 다음에 다시 묻는다.
-        const choice = await choose(s, {
-          title: '저장하지 않은 편집 내용이 있어요',
-          message: `${fmtDate(rec.savedAt)}에 편집하던 "${rec.draft.title || '제목 없음'}" 내용을 복구할까요?`,
-          options: [
-            { value: 'restore', label: '복구하기', cls: 'primary' },
-            { value: 'discard', label: '버리고 새로 시작', cls: 'danger' },
-          ],
-        });
-        if (S !== s) return;
-        if (choice === 'restore') {
-          s.draft = normalizeSafe(rec.draft);
-          s.dirty = true;
-        } else if (choice === 'discard') {
-          clearRecovery();
-        }
-      }
-    }
+    await offerRecovery(s, song);
+    if (S !== s) return;
 
     if (s.draft.audio) {
       try {
@@ -737,6 +1134,43 @@ async function load(s, params) {
   }
   if (S !== s) return;
   if (s.audioBlob) setupAudioEl(s, s.audioBlob);
+}
+
+/**
+ * 저장하지 않은 편집 내용(복구본)이 있으면 복구할지 묻는다.
+ * 저장된 곡은 그 곡의 복구본만, 새 곡은 저장한 적 없는 새 곡 복구본들을 보여준다.
+ * 창을 그냥 닫으면(null) 복구본을 남겨 두고, 이번 편집은 다른 칸에 써서 덮어쓰지 않는다.
+ */
+async function offerRecovery(s, song) {
+  let slots = readRecoveryStore();
+  const id = String(s.draft.id);
+  const updatedAt = song ? Number(song.updatedAt) || 0 : 0;
+  if (song) {
+    // 마지막 저장보다 오래된 이 곡의 복구본은 더 쓸 일이 없다 (남겨 두기로 한 것은 빼고)
+    const fresh = recoveryPrune(slots, id, updatedAt);
+    if (Object.keys(fresh).length !== Object.keys(slots).length) {
+      slots = fresh;
+      writeRecoveryStore(slots);
+    }
+  }
+  const cands = recoveryCandidates(slots, song ? { id, updatedAt } : {});
+  if (!cands.length) return;
+  const choice = await choose(s, recoveryPrompt(cands, { existing: Boolean(song), updatedAt }));
+  if (S !== s) return;
+  const picked = typeof choice === 'string' && choice.startsWith('restore:') ? cands[Number(choice.slice(8))] : null;
+  if (picked) {
+    s.draft = normalizeSafe(picked.entry.draft);
+    s.recoverySlot = picked.slot;
+    s.dirty = true;
+  } else if (choice === 'discard') {
+    const drop = new Set(cands.map((c) => c.slot));
+    writeRecoveryStore(recoveryDrop(readRecoveryStore(), (e, k) => drop.has(k)));
+  } else {
+    // 창을 그냥 닫음: 남겨 두기로 표시해 이 곡을 저장한 뒤에도 지우지 않고 다음에 다시 물어본다
+    writeRecoveryStore(recoveryKeep(readRecoveryStore(), cands.map((c) => c.slot)));
+    // 남겨 둔 복구본과 같은 칸에 이번 편집을 쓰지 않도록
+    if (cands.some((c) => c.slot === sessionSlot(s))) s.recoverySlot = `${id}@${Date.now().toString(36)}`;
+  }
 }
 
 function attachGlobal(s) {
@@ -764,13 +1198,14 @@ function attachGlobal(s) {
     }
   };
   const onBeforeUnload = (e) => {
-    if (!s.dirty) return;
+    if (!recoveryDraft(s)) return;
     writeRecovery(s);
     e.preventDefault();
     e.returnValue = '';
   };
   const onVisibility = () => {
-    if (document.visibilityState === 'hidden' && s.dirty) writeRecovery(s);
+    // 백그라운드에서 탭이 정리될 수 있으니 숨겨질 때 바로 남긴다 (악보 보고 입력 중인 음 포함).
+    if (document.visibilityState === 'hidden') writeRecovery(s);
   };
   window.addEventListener('keydown', onKey);
   window.addEventListener('beforeunload', onBeforeUnload);
@@ -1160,7 +1595,8 @@ function buildLyrics(s) {
   const { ui } = s;
   ui.lyricSource = el('span', { class: 'badge ed-src' });
   ui.lrcBanner = el('div', { class: 'ed-banner', hidden: true },
-    el('span', null, 'LRC 파일의 시간 정보로 가사를 보여주고 있어요. 노트와 상관없이 정해진 시간에 색이 바뀌어요.'),
+    el('span', null, 'LRC 파일의 시간 정보로 가사를 보여주고 있어요. 노트와 상관없이 정해진 시간에 색이 바뀌어요. '
+      + 'LRC 시간은 반주 음원 기준이라 음원 오프셋을 바꾸면 가사도 함께 움직여요.'),
     btn('노트 기준으로 바꾸기', () => switchToNotes(s), 'small'),
   );
   ui.pasteBanner = el('div', { class: 'ed-banner', hidden: true },
@@ -1332,10 +1768,11 @@ function renderSelection(s) {
 function markDirty(s) {
   if (s.disposed) return;
   s.dirty = true;
+  s.rev++;
   renderHeader(s);
   clearTimeout(s.recoveryTimer);
   s.recoveryTimer = setTimeout(() => {
-    if (!s.disposed && s.dirty) writeRecovery(s);
+    if (!s.disposed) writeRecovery(s);
   }, 1000);
 }
 
@@ -1356,19 +1793,17 @@ function notesChanged(s, { keepSel = false } = {}) {
 // Undo
 // ---------------------------------------------------------------------------
 
-function pushUndo(s, label, { basics = false } = {}) {
-  const d = s.draft;
-  s.undo.push({
-    label,
-    notes: copyNotes(d.notes),
-    lyrics: copyLyrics(d.lyrics),
-    audioOffset: d.audio ? d.audio.offset : null,
-    basics: basics ? {
-      title: d.title, artist: d.artist, description: d.description,
-      bpm: d.bpm, beatsPerBar: d.beatsPerBar, offset: d.offset,
-    } : null,
-  });
+const defer = typeof queueMicrotask === 'function' ? queueMicrotask : (fn) => Promise.resolve().then(fn);
+
+/**
+ * 작업 직전에 부른다. lyrics/audio/basics는 그 작업이 바꿀 수 있는 것만 켠다.
+ * 작업(동기)이 끝나면 sealUndoSnapshot이 실제로 바뀐 칸만 남긴다.
+ */
+function pushUndo(s, label, opts = {}) {
+  const snap = makeUndoSnapshot(s.draft, label, opts);
+  s.undo.push(snap);
   if (s.undo.length > UNDO_LIMIT) s.undo.shift();
+  defer(() => sealUndoSnapshot(snap, s.draft));
   renderHeader(s);
 }
 
@@ -1379,10 +1814,7 @@ function undo(s) {
     return;
   }
   const d = s.draft;
-  d.notes = snap.notes;
-  d.lyrics = snap.lyrics;
-  if (d.audio && snap.audioOffset != null) d.audio.offset = snap.audioOffset;
-  if (snap.basics) Object.assign(d, snap.basics);
+  applyUndoSnapshot(d, snap);
   s.sel = null;
   refreshLyrics(s);
   renderAll(s, true);
@@ -1757,7 +2189,7 @@ function toolTrim(s) {
     s.app.toast('첫 노트가 이미 0초에 있어요.');
     return;
   }
-  pushUndo(s, '앞 공백 제거', { basics: true });
+  pushUndo(s, '앞 공백 제거', { basics: true, lyrics: true, audio: true });
   const d = s.draft;
   d.notes = res.notes;
   d.offset = res.offset;
@@ -1815,7 +2247,7 @@ function openTempoDialog(s) {
       m.close();
       return;
     }
-    pushUndo(s, '빠르기 바꾸기', { basics: true });
+    pushUndo(s, '빠르기 바꾸기', { basics: true, lyrics: true });
     const res = scaleTempo(d, Math.round(v * 100) / 100);
     d.bpm = res.bpm;
     d.offset = res.offset;
@@ -2065,7 +2497,7 @@ function autoPlaceLyrics(s) {
 }
 
 function switchToNotes(s) {
-  pushUndo(s, '노트 기준으로 바꾸기');
+  pushUndo(s, '노트 기준으로 바꾸기', { lyrics: true });
   const lyr = s.draft.lyrics;
   s.draft.lyrics = { text: lyr.text || lyricsPlainText(lyr.lines || []), source: 'notes', lines: [] };
   refreshLyrics(s);
@@ -2087,7 +2519,7 @@ async function fillSolfege(s) {
     });
     if (!ok || s.disposed) return;
   }
-  pushUndo(s, '계이름으로 채우기');
+  pushUndo(s, '계이름으로 채우기', { lyrics: true });
   s.draft.lyrics = { text: solfegeLyricText(s.draft.notes), source: 'notes', lines: [] };
   refreshLyrics(s);
   renderLyrics(s, true);
@@ -2111,8 +2543,10 @@ function applyLrcText(s, text, label = 'LRC 가져오기') {
     return false;
   }
   const d = s.draft;
-  pushUndo(s, label, { basics: true });
-  d.lyrics = { text: lyricsPlainText(lines), source: 'lrc', lines };
+  pushUndo(s, label, { basics: true, lyrics: true });
+  // LRC 시간은 반주 음원 기준 → 곡 시간 = LRC 시간 + 음원 오프셋
+  const songLines = lrcLinesToSongTime(lines, lrcAudioOffset(d));
+  d.lyrics = { text: lyricsPlainText(songLines), source: 'lrc', lines: songLines };
   const meta = res.meta || {};
   if (!d.title.trim() && meta.ti) d.title = String(meta.ti).trim();
   if (!String(d.artist || '').trim() && meta.ar) d.artist = String(meta.ar).trim();
@@ -2164,7 +2598,9 @@ function exportLrc(s) {
   }
   try {
     const d = s.draft;
-    const text = toLRC(lines, { ti: d.title.trim() || undefined, ar: String(d.artist || '').trim() || undefined });
+    // LRC 파일은 반주 음원 기준 시간으로 내보낸다 (다시 가져오면 같은 위치)
+    const out = songLinesToLrcTime(lines, lrcAudioOffset(d));
+    const text = toLRC(out, { ti: d.title.trim() || undefined, ar: String(d.artist || '').trim() || undefined });
     downloadFile(`${fileBase(d.title)}.lrc`, text, 'text/plain');
     s.app.toast('LRC 파일을 내보냈어요.', 'success');
   } catch (err) {
@@ -2248,15 +2684,11 @@ async function pickAudio(s) {
     s.app.toast('이 브라우저에서 재생할 수 없는 음원 형식이에요. MP3나 M4A로 바꿔 보세요.', 'error');
     return;
   }
-  const prev = s.draft.audio;
   s.audioBlob = file;
   s.audioChanged = true;
+  s.audioRev++;
   s.audioMissing = false;
-  s.draft.audio = {
-    name: file.name || '음원',
-    offset: prev && Number.isFinite(prev.offset) ? prev.offset : 0,
-    volume: prev && Number.isFinite(prev.volume) ? prev.volume : 0.8,
-  };
+  s.draft.audio = pickedAudioInfo(s.draft.audio, file.name);
   setupAudioEl(s, file);
   markDirty(s);
   renderAudio(s);
@@ -2267,9 +2699,11 @@ async function pickAudio(s) {
 }
 
 async function removeAudio(s) {
+  const lrcMoves = s.draft.lyrics.source === 'lrc' && Math.abs(lrcAudioOffset(s.draft)) >= 0.0005;
   const ok = await confirmDialog({
     title: '반주 음원을 뺄까요?',
-    message: '저장하면 이 기기에 보관된 음원 파일도 지워져요.',
+    message: '저장하면 이 기기에 보관된 음원 파일도 지워져요.'
+      + (lrcMoves ? ' LRC 가사 시간은 음원 기준이라, 음원 오프셋만큼 LRC 파일의 원래 시간으로 돌아가요. 같은 곡의 다른 음원 파일로 바꾸려면 「교체」를 쓰세요.' : ''),
     okText: '빼기',
     cancelText: '취소',
     danger: true,
@@ -2278,8 +2712,13 @@ async function removeAudio(s) {
   disposeAudioEl(s);
   s.audioBlob = null;
   s.audioChanged = true;
+  s.audioRev++;
   s.audioMissing = false;
-  s.draft.audio = null;
+  const moved = removeDraftAudio(s.draft);
+  if (moved && s.draft.lyrics.source === 'lrc') {
+    refreshLyrics(s);
+    renderLyricPreview(s);
+  }
   markDirty(s);
   renderAudio(s);
   scheduleRoll(s);
@@ -2287,8 +2726,13 @@ async function removeAudio(s) {
 
 function setAudioOffset(s, v, { updateInput = true } = {}) {
   if (!s.draft.audio || !Number.isFinite(v)) return;
-  s.draft.audio.offset = round3(clamp(v, -3600, 3600));
+  const delta = setDraftAudioOffset(s.draft, v);
   if (updateInput && s.ui.audioOffset) s.ui.audioOffset.value = String(s.draft.audio.offset);
+  if (delta && s.draft.lyrics.source === 'lrc') {
+    // LRC 가사가 음원과 함께 움직였다
+    refreshLyrics(s);
+    renderLyricPreview(s);
+  }
   markDirty(s);
   scheduleRoll(s);
 }
@@ -2429,7 +2873,7 @@ function openAlign(s) {
     }
     const at = a.currentTime;
     a.pause();
-    pushUndo(s, '음원 오프셋 맞추기');
+    pushUndo(s, '음원 오프셋 맞추기', { audio: true, lyrics: true });
     setAudioOffset(s, Math.round((firstT - at) * 100) / 100);
     m.close();
     s.app.toast(`오프셋을 ${s.draft.audio.offset}초로 맞췄어요. 미리듣기로 확인하고 ±로 다듬어 보세요.`, 'success');
@@ -2659,6 +3103,10 @@ function openMidiImport(s, file, bytes) {
 
   const ts = parsed.timeSignature || { num: 4, den: 4 };
   const midiBpm = Math.round((Number(parsed.bpm) || 120) * 100) / 100;
+  // 6/8·2/2 같은 박자는 BPM을 박자표의 박 단위로 바꿔야 마디 길이가 맞는다 (MusicXML 가져오기와 같은 규칙).
+  const grid = midiBeatGrid(ts, midiBpm);
+  const unitName = { 1: '온음표', 2: '2분음표', 4: '4분음표', 8: '8분음표', 16: '16분음표' }[grid.unit] || '';
+  const tempoLabel = `BPM ${grid.bpm}${grid.unit !== 4 && unitName ? ` (${unitName} 기준)` : ''}, 한 마디 ${grid.beatsPerBar}박`;
   const content = el('div', { class: 'ed-dialog ed-midi' },
     el('p', { class: 'muted' }, `${file.name} · BPM ${midiBpm} · ${ts.num}/${ts.den} · 길이 ${fmtClock(parsed.duration || 0)}`),
     el('div', { class: 'ed-label' }, '트랙 선택 (멜로디가 들어 있는 트랙)'),
@@ -2675,7 +3123,7 @@ function openMidiImport(s, file, bytes) {
       )),
     el('label', { class: 'ed-check' },
       checkbox(st.tempo, (v) => { st.tempo = v; }),
-      el('span', null, `BPM·박자도 가져오기 (BPM ${midiBpm}, ${ts.num}/${ts.den})`)),
+      el('span', null, `BPM·박자도 가져오기 (${ts.num}/${ts.den} → ${tempoLabel})`)),
     summary,
     el('div', { class: 'ed-modal-actions' }, btn('취소', () => m.close(), 'ghost'), applyBtn),
   );
@@ -2690,8 +3138,8 @@ function openMidiImport(s, file, bytes) {
     pushUndo(s, 'MIDI 가져오기', { basics: true });
     d.notes = sortNotes(notes);
     if (st.tempo) {
-      d.bpm = clamp(midiBpm, 30, 300);
-      d.beatsPerBar = clamp(Math.round(Number(ts.num) || 4), 1, 16);
+      d.bpm = grid.bpm;
+      d.beatsPerBar = grid.beatsPerBar;
       d.offset = 0;
     }
     if (!d.title.trim()) d.title = fileTitle(file.name).slice(0, 100);
@@ -3045,7 +3493,7 @@ async function openMusicXmlImport(s, file, bytes) {
     if (!notes.length) return;
     const withLyrics = wantsLyrics(st.key) && String(res.lyricText || '').trim() !== '';
     const d = s.draft;
-    pushUndo(s, '악보 파일 가져오기', { basics: true });
+    pushUndo(s, '악보 파일 가져오기', { basics: true, lyrics: true });
     d.notes = notes;
     const bpm = Number(res.bpm);
     if (bpm > 0) d.bpm = clamp(Math.round(bpm * 100) / 100, 30, 300);
@@ -3213,10 +3661,25 @@ function openStepPanel(s, mode) {
     confirming: false,
     closed: false,
     raf: 0,
+    persistTimer: 0,
   };
   const keyTimers = new Map();
   const r = {};
   const curTicks = () => stepTicks(st.value, { dotted: st.dotted, triplet: st.triplet });
+
+  // 입력 중인 음은 「완료」 전까지 초안에 없으므로, 탭이 정리돼도 남도록 임시 초안을 복구 칸에 쓴다.
+  const provisional = () => {
+    if (st.closed || !stepNoteCount(st.entries)) return null;
+    const { notes } = stepMergeNotes(s.draft.notes, st.entries, { bpm, origin, startTick, append });
+    return { ...s.draft, notes };
+  };
+  s.provisional = provisional;
+  const schedulePersist = () => {
+    clearTimeout(st.persistTimer);
+    st.persistTimer = setTimeout(() => {
+      if (!st.closed && !s.disposed) syncRecovery(s);
+    }, 1000);
+  };
 
   // --- top bar: 위치 · 다음 가사 · 취소/완료 ------------------------------------
   r.pos = el('div', { class: 'ed-step-pos', 'aria-live': 'polite' });
@@ -3350,12 +3813,14 @@ function openStepPanel(s, mode) {
     st.entries.push({ kind: 'note', m, ticks });
     sound(m, ticks * spt);
     update();
+    schedulePersist();
   };
   const addRest = () => {
     if (full()) return;
     stopStepPlayback();
     st.entries.push({ kind: 'rest', ticks: curTicks() });
     update();
+    schedulePersist();
   };
   const addTie = () => {
     if (!stepCanTie(st.entries)) {
@@ -3366,12 +3831,14 @@ function openStepPanel(s, mode) {
     stopStepPlayback();
     st.entries.push({ kind: 'tie', ticks: curTicks() });
     update();
+    schedulePersist();
   };
   const back = () => {
     if (!st.entries.length) return;
     stopStepPlayback();
     st.entries.pop();
     update();
+    schedulePersist();
   };
 
   // --- 들어보기 -------------------------------------------------------------------
@@ -3618,6 +4085,8 @@ function openStepPanel(s, mode) {
   let ro = null;
   const cleanup = () => {
     st.closed = true;
+    clearTimeout(st.persistTimer);
+    if (s.provisional === provisional) s.provisional = null;
     stopStepPlayback();
     if (st.raf) cancelAnimationFrame(st.raf);
     st.raf = 0;
@@ -3643,17 +4112,20 @@ function openStepPanel(s, mode) {
       if (!ok || st.closed) return;
     }
     m.close();
+    // 버린 입력이 복구 칸에 남지 않도록 지금 초안 상태로 맞춘다
+    if (!s.disposed) syncRecovery(s);
   };
 
   const done = () => {
-    const notes = stepEntriesToNotes(st.entries, { bpm, origin, startTick });
+    const merged = stepMergeNotes(s.draft.notes, st.entries, { bpm, origin, startTick, append });
+    const notes = merged.added;
     if (!notes.length) {
       s.app.toast('입력한 음이 없어요.');
       return;
     }
     const dr = s.draft;
     pushUndo(s, '악보 보고 입력');
-    dr.notes = append ? sortNotes([...dr.notes, ...notes]) : sortNotes(notes);
+    dr.notes = merged.notes;
     m.close();
     notesChanged(s);
     s.app.toast(`노트 ${notes.length}개를 ${append ? '이어서 넣었어요' : '넣었어요'}.`, 'success');
@@ -3684,9 +4156,10 @@ function openStepPanel(s, mode) {
 // ---------------------------------------------------------------------------
 
 async function ensureMic(s) {
-  const unlocking = unlock(s);
+  // 사용자 제스처 안에서 잠금 해제를 가장 먼저 시작한다. 첫 탭이 오디오 모듈 로드보다 빠를 수 있으므로
+  // 입력 객체는 잠금 해제(= 모듈 로드 대기)가 끝난 뒤에 가져온다.
+  await unlock(s);
   const input = s.app.getInput();
-  await unlocking;
   if (!input) {
     const err = new Error('오디오 기능을 불러오지 못했어요.');
     err.code = 'unsupported';
@@ -4069,12 +4542,17 @@ async function save(s) {
   const { app } = s;
   s.saving = true;
   renderActions(s);
+  // 저장(IndexedDB, 큰 음원은 몇 초)하는 동안에도 편집할 수 있다 → 끝났을 때 바뀌었는지 확인한다.
+  const rev = s.rev;
+  const audioRev = s.audioRev;
+  const startedAt = Date.now();
   try {
     const song = finalizeDraft(s);
     if (s.audioChanged) {
       if (song.audio && s.audioBlob) {
         await app.library.saveAudio(song.id, s.audioBlob);
-      } else if (!song.audio) {
+      } else {
+        // 음원을 뺐다 (그 뒤 JSON 가져오기로 파일 없는 음원 정보만 생겼어도 예전 파일은 지운다)
         try { await app.library.removeAudio(song.id); } catch (err) { console.error(err); }
       }
     }
@@ -4084,13 +4562,24 @@ async function save(s) {
     let stored = null;
     try { stored = await app.library.get(song.id); } catch (err) { console.error(err); }
     if (s.disposed) return true;
+    if (s.rev !== rev) {
+      // 저장하는 동안 고친 내용은 그대로 두고 '저장 안 됨'으로 남긴다 (초안·입력 칸을 저장본으로 덮어쓰지 않는다).
+      s.stored = stored || { ...normalizeSafe(result), builtin: false };
+      s.audioChanged = s.audioRev !== audioRev;
+      // 저장하는 동안 쓴 복구본은 저장(updatedAt)보다 이전으로 보여 다음에 열 때 버려진다 → 지금 다시 쓴다
+      clearTimeout(s.recoveryTimer);
+      writeRecovery(s, Math.max(Number(s.stored.updatedAt) || 0, Number(result.updatedAt) || 0));
+      renderHeader(s);
+      app.toast('저장했어요. 저장하는 동안 바꾼 내용은 아직 저장되지 않았어요. 한 번 더 저장해 주세요.', 'info');
+      return true;
+    }
     s.draft = normalizeSafe(result);
     s.stored = stored || { ...s.draft, builtin: false };
     s.sel = null;
     s.dirty = false;
     s.audioChanged = false;
     clearTimeout(s.recoveryTimer);
-    clearRecovery();
+    clearSavedRecovery(s, song.id, startedAt);
     refreshLyrics(s);
     renderAll(s, true);
     app.toast(song.audio && s.audioMissing ? '저장했어요. (반주 음원 파일은 다시 선택해 주세요)' : '저장했어요.', 'success');
@@ -4172,7 +4661,7 @@ async function importJson(s) {
     });
     if (!ok || s.disposed) return;
   }
-  pushUndo(s, 'JSON 가져오기', { basics: true });
+  pushUndo(s, 'JSON 가져오기', { basics: true, lyrics: true, audio: true });
   d.title = song.title || d.title;
   d.artist = song.artist || '';
   d.description = song.description || '';
@@ -4180,10 +4669,14 @@ async function importJson(s) {
   d.beatsPerBar = song.beatsPerBar;
   d.offset = song.offset;
   d.notes = song.notes;
-  d.lyrics = song.lyrics;
-  if (song.audio && s.audioBlob && d.audio) {
-    d.audio = { ...d.audio, offset: song.audio.offset, volume: song.audio.volume };
-  } else if (song.audio && !s.audioBlob) {
+  // LRC 가사는 음원 오프셋 기준: 음원 파일이 없어도 가져온 음원 정보(오프셋)를 남겨 두어야
+  // 음원을 다시 골랐을 때 오프셋을 이어받고 가사가 두 번 옮겨지지 않는다.
+  const hasFile = Boolean(s.audioBlob);
+  const imported = importedAudioState(song, d.audio, hasFile);
+  d.audio = imported.audio;
+  d.lyrics = imported.lyrics;
+  s.audioMissing = imported.missing;
+  if (song.audio && !hasFile) {
     s.app.toast('반주 음원 파일은 JSON에 들어 있지 않아요. 음원을 다시 선택해 주세요.');
   }
   s.sel = null;
@@ -4223,7 +4716,9 @@ function preview(s, mode) {
       audioBlob: s.audioBlob,
       dirty: s.dirty,
       audioChanged: s.audioChanged,
-      editorUi: { notationText: s.notationText, zoom: s.zoom, templateDesc: s.templateDesc, undo: s.undo },
+      editorUi: {
+        notationText: s.notationText, zoom: s.zoom, templateDesc: s.templateDesc, undo: s.undo, recoverySlot: s.recoverySlot,
+      },
     },
   });
 }
@@ -4258,7 +4753,7 @@ async function deleteOrReset(s) {
       });
       if (!ok || s.disposed) return;
       await app.library.remove(id);
-      clearRecovery();
+      clearSongRecovery(s, id);
       const song = await app.library.get(id);
       if (s.disposed) return;
       disposeAudioEl(s);
@@ -4300,7 +4795,8 @@ async function deleteOrReset(s) {
       });
       if (!ok || s.disposed) return;
     }
-    clearRecovery();
+    clearTimeout(s.recoveryTimer);
+    clearSongRecovery(s, id);
     s.dirty = false;
     app.go('home');
   } catch (err) {
@@ -4324,10 +4820,11 @@ async function leave(s) {
     if (s.disposed || !choice || choice === 'cancel') return;
     if (choice === 'save') {
       const ok = await save(s);
-      if (!ok || s.disposed) return;
+      // 저장하는 동안 또 바뀌었으면 나가지 않는다 (배지가 '저장 안 됨'으로 남아 있다)
+      if (!ok || s.disposed || s.dirty) return;
     } else {
       clearTimeout(s.recoveryTimer);
-      clearRecovery();
+      dropSessionRecovery(s);
       s.dirty = false;
     }
   }

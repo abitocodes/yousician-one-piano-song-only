@@ -25,10 +25,25 @@ function makeSongId() {
   return `song-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/** app.holdUpdates() when the app has it: an app update must not reload the page until release() is called. */
+function holdUpdates(app) {
+  return typeof app?.holdUpdates === 'function' ? app.holdUpdates() : () => {};
+}
+
 /** Picks a .json file holding one song, an array of songs, or { songs: [...] } and saves them. → imported count */
 export async function importSongs(app) {
   const file = await pickFile('.json,application/json');
   if (!file) return 0;
+  // Until every song is saved (or the user cancels), an update reload would leave the import half done.
+  const release = holdUpdates(app);
+  try {
+    return await importFile(app, file);
+  } finally {
+    release();
+  }
+}
+
+async function importFile(app, file) {
   let data;
   try {
     data = JSON.parse(await file.text());
@@ -276,11 +291,17 @@ export async function mount(root, params, app) {
   root.append(topbar, body);
 
   async function startSong(song, mode) {
-    let audioBlob = null;
-    if (song.audio) {
-      try { audioBlob = await app.library.getAudio(song.id); } catch { /* play without backing */ }
+    // The tap is not lost to an update reload while the backing audio loads.
+    const release = holdUpdates(app);
+    try {
+      let audioBlob = null;
+      if (song.audio) {
+        try { audioBlob = await app.library.getAudio(song.id); } catch { /* play without backing */ }
+      }
+      await app.go('play', { songId: song.id, mode, audioBlob });
+    } finally {
+      release();
     }
-    app.go('play', { songId: song.id, mode, audioBlob });
   }
 
   function card(song) {

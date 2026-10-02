@@ -142,7 +142,8 @@ export function notesToNotation(notes, { bpm = 100, offset = 0, beatsPerBar = 4 
     const next = mel[i + 1];
     if (next) {
       const ns = beatOf(next);
-      if (ns > s) len = Math.min(len, ns - s);
+      // The next onset rounds to this slot (or earlier): take one 1/4-beat slot so the delay never cascades.
+      len = ns > s ? Math.min(len, ns - s) : 0.25;
     }
     items.push({ text: tokenText(noteName(n.m, 'en'), len), start: s });
     cursor = s + len;

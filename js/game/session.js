@@ -24,6 +24,7 @@ const SAME_STRIKE = 0.012;        // detections this close (raw ctx s) belong to
 const LATE_TOLERANCE = 0.05;      // audio events at most this late are still played
 const SUSPEND_PAUSE_MS = 700;     // auto-pause when the audio context stays suspended this long
 const SIM_RETRY_MS = 1200;        // practice + sim: replay the held notes if the detector missed them
+const MAX_OUTPUT_LATENCY = 0.5;   // cap for the device output-delay compensation (s)
 const EMPTY = Object.freeze([]);
 const EPS = 1e-6;
 
@@ -51,6 +52,30 @@ function lowerBound(notes, x) {
   return lo;
 }
 
+// Collapses notes at the same onset (within GROUP_EPS) and the same rounded pitch into one: a single
+// strike can only hit one of them, so the copy would be an unavoidable MISS. The kept note takes the
+// longest duration as a copy (the song's own note objects are never mutated). Input must be sorted.
+function dedupeNotes(notes) {
+  const out = [];
+  for (const n of notes) {
+    const m = Math.round(n.m);
+    let dup = -1;
+    for (let k = out.length - 1; k >= 0 && out[k].t >= n.t - GROUP_EPS - EPS; k--) {
+      if (Math.round(out[k].m) === m) {
+        dup = k;
+        break;
+      }
+    }
+    if (dup < 0) {
+      out.push(n);
+      continue;
+    }
+    const d = Number(n.d);
+    if (Number.isFinite(d) && !(Number(out[dup].d) >= d)) out[dup] = { ...out[dup], d };
+  }
+  return out.length === notes.length ? notes : out;
+}
+
 export class GameSession extends Emitter {
   constructor({ song, settings = {}, mode = 'play', input = null, audioBlob = null } = {}) {
     super();
@@ -62,8 +87,10 @@ export class GameSession extends Emitter {
     this.audioBlob = audioBlob || null;
 
     const raw = Array.isArray(song.notes) ? song.notes.filter((n) => n && Number.isFinite(n.t) && Number.isFinite(n.m)) : [];
-    this.notes = isSortedByTime(raw) ? raw : raw.slice().sort((a, b) => (a.t - b.t) || (a.m - b.m));
-    this.duration = songDuration(song);
+    // One array feeds the judge, the snapshot (renderer), the scheduler and the sim bookkeeping, so
+    // indices stay aligned everywhere.
+    this.notes = dedupeNotes(isSortedByTime(raw) ? raw : raw.sort((a, b) => (a.t - b.t) || (a.m - b.m)));
+    this.duration = songDuration({ notes: this.notes, lyrics: song.lyrics });
     this.firstNoteT = this.notes.length ? this.notes[0].t : null;
     let span = EXPECT_MIN_LEN;
     for (const n of this.notes) span = Math.max(span, Number(n.d) || 0);
@@ -105,6 +132,7 @@ export class GameSession extends Emitter {
     this._acceptFrom = -Infinity;
     this._releaseStrikeRaw = -Infinity;
     this._holdT = 0;
+    this._holdCtx = NaN;          // context time at which the held group reached the hit line
     this._holdMidis = EMPTY;
     this._hint = null;
     this._echo = null;
@@ -176,6 +204,7 @@ export class GameSession extends Emitter {
     this._hint = null;
     this._echo = null;
     this._holdMidis = EMPTY;
+    this._holdCtx = NaN;
     this._releaseStrikeRaw = -Infinity;
     this._lastCountdown = null;
     this._suspendedSince = 0;
@@ -281,7 +310,8 @@ export class GameSession extends Emitter {
       if (prev) prev.stop(this.ctx.currentTime);
       this._touchVoices.set(m, this.synth.playNote(m, this.ctx.currentTime, 8, { velocity: 0.75 }));
     }
-    if (this.mode === 'listen') return;
+    // Calibration measures the mic delay: screen/keyboard taps must never feed its deltas.
+    if (this.mode === 'listen' || this.mode === 'calibrate') return;
     if (this._state === 'playing') {
       this.judge.input({ time: this.clock.time(this._now()), midi: m });
     } else if (this._state === 'holding') {
@@ -314,19 +344,32 @@ export class GameSession extends Emitter {
     const echo = this._echo;
     if (echo && raw >= echo.from && raw <= echo.until && echo.pcs.has(pitchClass(midi))) return;
     if (st === 'holding') {
-      this._hitHeld(midi, raw);
+      this._hitHeld(midi, raw, tc);
     } else {
-      this.judge.input({ time: this.clock.toSong(tc), midi });
+      // The detector reports one note per pitch class per onset, so one detection also covers octave copies.
+      this.judge.input({ time: this.clock.toSong(tc), midi, octaves: true });
     }
   }
 
-  _hitHeld(midi, rawTime) {
-    const results = this.judge.hitHeld(midi);
+  // A hit while the song waits at a held group. `tc` (detector input only: the strike's latency-corrected
+  // context time) grades it by timing against the moment the group reached the hit line, like play mode,
+  // and lets the song resume from the strike rather than from when the detection arrived (input latency +
+  // detector delay later). Touch hits (no tc) keep the fixed 'good' and resume from now.
+  _hitHeld(midi, rawTime, tc = NaN) {
+    const now = this._now();
+    const cross = this._holdCtx;
+    const timed = Number.isFinite(tc) && Number.isFinite(cross);
+    // Never before the line crossing or the last (re)start/resume, never after now.
+    const resumeAt = timed ? Math.min(now, Math.max(tc, cross, this._acceptFrom)) : now;
+    const delta = timed ? (tc - cross) * this._speed : undefined;
+    const at = this._holdT + (now - resumeAt) * this._speed;
+    // Detector hits (rawTime set) also cover octave copies, as in play mode; a touch key is one note.
+    const results = this.judge.hitHeld(midi, delta, at, { octaves: rawTime !== null });
     if (!results.length) return;
     const fp = this.judge.firstPending();
     if (fp < 0 || this.notes[fp].t > this._holdT + GROUP_EPS + EPS) {
       if (rawTime !== null) this._releaseStrikeRaw = rawTime;
-      this._releaseHold();
+      this._releaseHold(now, resumeAt);
     } else {
       this._holdMidis = this.judge.pendingGroup().map((i) => this.notes[i].m);
     }
@@ -462,6 +505,9 @@ export class GameSession extends Emitter {
   _enterHold(now, index) {
     const t = this.notes[index].t;
     this._holdT = t;
+    // The frame that notices the crossing can land a little after it; remember the crossing itself.
+    const cross = this.clock.toCtx(t);
+    this._holdCtx = Number.isFinite(cross) ? Math.min(now, cross) : now;
     this.clock.hold(now, t);
     this._cancelAfter(t + GROUP_EPS);
     if (this.backing) this.backing.pause();
@@ -509,14 +555,15 @@ export class GameSession extends Emitter {
     }
   }
 
-  _releaseHold() {
-    const now = this._now();
-    this.clock.release(now);
+  // Resumes the song as if it had been running since `resumeAt` (≤ now), so it catches up with a player
+  // whose strike was only detected later.
+  _releaseHold(now, resumeAt = now) {
+    this.clock.release(Math.min(now, resumeAt));
     this._hint = null;
     this._holdMidis = EMPTY;
     if (this._state === 'holding') {
       this._resetScheduler(this._holdT + GROUP_EPS + EPS);
-      if (this.backing) this.backing.play(this._holdT, this._speed, this._audioOffset());
+      if (this.backing) this.backing.play(this.clock.time(now), this._speed, this._audioOffset());
       this._lastSync = now;
       this._setState('playing');
     }
@@ -550,7 +597,12 @@ export class GameSession extends Emitter {
 
   _scheduleAudio(songTime) {
     if (!this.synth) return;
-    const horizon = songTime + SCHEDULE_AHEAD * this._speed;
+    // Sounds are heard `outLat` after their context time: start them that much earlier (and look that
+    // much further ahead) so they are heard when their note reaches the line. Right after a scheduler
+    // reset (resume, speed change, hold release) that start can already be past: such a sound plays now,
+    // a little late, rather than not at all (_startAt).
+    const outLat = this._outLat();
+    const horizon = songTime + (SCHEDULE_AHEAD + outLat) * this._speed;
     const from = this._schedFrom;
     if (horizon <= from) return;
     const ctxNow = this.ctx.currentTime;
@@ -562,11 +614,13 @@ export class GameSession extends Emitter {
     let i = this._schedNote;
     if (sim || guide) {
       const dest = sim ? this._simDest() : undefined;
+      // Simulated input reaches the detector directly (no output delay), so it stays on the beat.
+      const lead = sim ? 0 : outLat;
       for (; i < notes.length && notes[i].t < horizon; i++) {
         const n = notes[i];
         if (n.t < from - EPS) continue;
-        const when = this.clock.toCtx(n.t);
-        if (when < ctxNow - LATE_TOLERANCE) continue;
+        const when = this._startAt(n.t, lead, ctxNow);
+        if (when === null) continue;
         const vel = Number.isFinite(n.v) ? clamp(n.v, 0.4, 1) : 0.8;
         const h = this.synth.playNote(n.m, when, Math.max(0.05, n.d / this._speed), { velocity: vel, destination: dest });
         this._voices.push({ h, songT: n.t, end: h.end });
@@ -578,13 +632,13 @@ export class GameSession extends Emitter {
     this._schedNote = i;
 
     if (this.mode !== 'calibrate') {
-      if (this._opt('metronome', false)) this._scheduleBeats(from, horizon, ctxNow);
-      this._scheduleCountIn(from, horizon, ctxNow);
+      if (this._opt('metronome', false)) this._scheduleBeats(from, horizon, ctxNow, outLat);
+      this._scheduleCountIn(from, horizon, ctxNow, outLat);
     }
     this._schedFrom = horizon;
   }
 
-  _scheduleBeats(from, horizon, ctxNow) {
+  _scheduleBeats(from, horizon, ctxNow, lead) {
     const bpm = clamp(Number(this.song.bpm) || 100, 20, 400);
     const beat = 60 / bpm;
     const offset = Number(this.song.offset) || 0;
@@ -594,22 +648,30 @@ export class GameSession extends Emitter {
       const t = offset + k * beat;
       if (t >= horizon) break;
       if (t < from) continue;
-      const when = this.clock.toCtx(t);
-      if (when < ctxNow - LATE_TOLERANCE) continue;
+      const when = this._startAt(t, lead, ctxNow);
+      if (when === null) continue;
       const h = this.synth.click(when, ((k % perBar) + perBar) % perBar === 0);
       this._voices.push({ h, songT: t, end: h.end });
     }
   }
 
-  _scheduleCountIn(from, horizon, ctxNow) {
+  _scheduleCountIn(from, horizon, ctxNow, lead) {
     if (this.firstNoteT === null) return;
     for (let k = COUNTDOWN; k >= 1; k--) {
       const t = this.firstNoteT - k * this._speed;
       if (t < from || t >= horizon || t < this._startSongTime - EPS) continue;
-      const when = this.clock.toCtx(t);
-      if (when < ctxNow - LATE_TOLERANCE) continue;
+      const when = this._startAt(t, lead, ctxNow);
+      if (when === null) continue;
       this.synth.sfx('count', when);
     }
+  }
+
+  // Context start time for a chart sound at song time t, `lead` s early for the output delay; null when its
+  // moment (judged without the lead) is already more than LATE_TOLERANCE past.
+  _startAt(t, lead, ctxNow) {
+    const at = this.clock.toCtx(t);
+    if (!(at >= ctxNow - LATE_TOLERANCE)) return null;
+    return Math.max(ctxNow, at - lead);
   }
 
   // Stop scheduled chart audio belonging to song times after `songCut` (not-yet-started voices are
@@ -714,6 +776,14 @@ export class GameSession extends Emitter {
   _latency() {
     if (this.mode === 'calibrate' || !this._micActive()) return 0;
     return clamp(Number(this._opt('latency', 0.1)) || 0, -0.2, 0.6);
+  }
+
+  // Device output delay (s) reported by the audio context, e.g. large with Bluetooth earphones.
+  _outLat() {
+    const c = this.ctx;
+    if (!c) return 0;
+    const v = (Number(c.baseLatency) || 0) + (Number(c.outputLatency) || 0);
+    return clamp(v, 0, MAX_OUTPUT_LATENCY);
   }
 
   _micActive() {

@@ -78,6 +78,8 @@ export async function mount(root, params = {}, app) {
     lastSongTime: NaN,
     finished: false,
     starting: false,
+    reconnecting: false, // restarting a lost mic from 계속 / 처음부터
+    confirmingExit: false,
     finishTimer: 0,
     flashEl: null,
     frameErrorLogged: false,
@@ -449,7 +451,8 @@ function buildReady(st) {
       h('button', { type: 'button', class: 'btn ghost', onClick: () => goExit(st) }, '나가기'),
       fsBtn,
       e.start),
-    mode !== 'listen'
+    // Calibration measures the mic only: screen keys and the computer keyboard are ignored there.
+    acceptsKeys(mode)
       ? h('p', { class: 'pk-keys-hint' }, '키보드로도 칠 수 있어요: A W S E D F T G Y H U J K = 도(C4)~도(C5) · Space 일시정지')
       : null);
   return h('div', { class: 'overlay pk-overlay pk-ready' }, panel);
@@ -458,12 +461,17 @@ function buildReady(st) {
 function buildPause(st) {
   const e = st.els;
   e.pauseInfo = h('p', { class: 'pk-pause-info' });
+  e.pauseErr = h('div', { class: 'pk-mic-error pk-pause-error', role: 'alert' });
+  e.pauseErr.hidden = true;
+  e.resumeBtn = h('button', { type: 'button', class: 'btn primary big', onClick: () => resume(st) }, '계속');
+  e.restartBtn = h('button', { type: 'button', class: 'btn big', onClick: () => restart(st) }, '처음부터');
   const panel = h('div', { class: 'panel pk-panel pk-pause-panel' },
     h('h2', null, '일시정지'),
     e.pauseInfo,
+    e.pauseErr,
     h('div', { class: 'pk-stack-actions' },
-      h('button', { type: 'button', class: 'btn primary big', onClick: () => resume(st) }, '계속'),
-      h('button', { type: 'button', class: 'btn big', onClick: () => restart(st) }, '처음부터'),
+      e.resumeBtn,
+      e.restartBtn,
       h('button', { type: 'button', class: 'btn ghost big', onClick: () => goExit(st) }, '나가기')));
   return h('div', { class: 'overlay pk-overlay pk-pause' }, panel);
 }
@@ -498,7 +506,9 @@ function setStartBusy(st, busy, label) {
   b.textContent = busy ? (label || '준비 중…') : b.dataset.label;
 }
 
-function micErrorInfo(st, err) {
+// `touch` offers '터치 모드로 전환'. Never in calibrate mode: the calibration measures the mic delay, and touch
+// timing would be saved as the mic latency.
+export function micErrorInfo(st, err) {
   const code = err && err.code;
   if (st.inputMode === 'touch' || st.mode === 'listen') {
     return {
@@ -507,25 +517,30 @@ function micErrorInfo(st, err) {
       touch: false,
     };
   }
+  const touch = st.mode !== 'calibrate';
   switch (code) {
     case 'denied':
       return {
         title: '마이크 권한이 필요해요',
         body: '브라우저가 마이크 사용을 막고 있어요. 주소창 왼쪽의 자물쇠(사이트 정보) 아이콘 → 권한에서 마이크를 "허용"으로 바꾼 뒤 '
           + '다시 시도해 주세요. 삼성 인터넷은 메뉴 → 설정 → 사이트 및 다운로드 → 사이트 권한 → 마이크에서도 바꿀 수 있어요.',
-        touch: true,
+        touch,
       };
     case 'insecure':
       return {
         title: '보안 연결(HTTPS)이 필요해요',
-        body: '마이크는 https:// 로 시작하는 주소에서만 쓸 수 있어요. 보안 주소로 다시 접속하거나, 지금은 터치 모드로 연주해 주세요.',
-        touch: true,
+        body: touch
+          ? '마이크는 https:// 로 시작하는 주소에서만 쓸 수 있어요. 보안 주소로 다시 접속하거나, 지금은 터치 모드로 연주해 주세요.'
+          : '마이크는 https:// 로 시작하는 주소에서만 쓸 수 있어요. 보안 주소로 다시 접속한 뒤 측정해 주세요.',
+        touch,
       };
     case 'unsupported':
       return {
         title: '마이크를 지원하지 않는 브라우저예요',
-        body: '최신 Chrome 또는 삼성 인터넷에서 열어 주세요. 지금은 터치 모드로 연주할 수 있어요.',
-        touch: true,
+        body: touch
+          ? '최신 Chrome 또는 삼성 인터넷에서 열어 주세요. 지금은 터치 모드로 연주할 수 있어요.'
+          : '최신 Chrome 또는 삼성 인터넷에서 열어 주세요. 타이밍 보정은 마이크로만 측정할 수 있어요.',
+        touch,
       };
     default: {
       let body = '';
@@ -535,26 +550,35 @@ function micErrorInfo(st, err) {
       if (!body) {
         body = `다른 앱이 마이크를 쓰고 있지 않은지 확인한 뒤 다시 시도해 주세요.${err && err.message ? ` (${err.message})` : ''}`;
       }
-      return { title: '마이크를 시작하지 못했어요', body, touch: true };
+      return { title: '마이크를 시작하지 못했어요', body, touch };
     }
   }
 }
 
-function showMicError(st, err) {
-  const e = st.els;
-  const info = micErrorInfo(st, err);
-  e.micErr.replaceChildren(
+function errorBox(info, actions) {
+  return [
     h('div', { class: 'pk-err-title' }, h('span', { class: 'pk-ico', html: ICON.alert }), info.title),
     h('p', null, info.body),
-    h('div', { class: 'pk-err-actions' },
-      h('button', { type: 'button', class: 'btn small', onClick: () => onStart(st) }, '다시 시도'),
-      info.touch
-        ? h('button', { type: 'button', class: 'btn small primary', onClick: () => switchToTouch(st) }, '터치 모드로 전환')
-        : null));
+    actions && actions.some(Boolean) ? h('div', { class: 'pk-err-actions' }, actions) : null,
+  ].filter(Boolean);
+}
+
+/** Error panel on the ready screen. `info` overrides the message derived from `err`; `info.retry === false` hides 다시 시도. */
+function showMicError(st, err, info = micErrorInfo(st, err)) {
+  const e = st.els;
+  e.micErr.replaceChildren(...errorBox(info, [
+    info.retry !== false
+      ? h('button', { type: 'button', class: 'btn small', onClick: () => onStart(st) }, '다시 시도')
+      : null,
+    info.touch && st.mode !== 'calibrate'
+      ? h('button', { type: 'button', class: 'btn small primary', onClick: () => switchToTouch(st) }, '터치 모드로 전환')
+      : null,
+  ]));
   e.micErr.hidden = false;
 }
 
 function switchToTouch(st) {
+  if (st.mode === 'calibrate') return;
   st.inputMode = 'touch';
   st.settings.inputMode = 'touch';
   try { st.app.settings.set('inputMode', 'touch'); } catch (err) { console.warn('[play] settings', err); }
@@ -563,12 +587,198 @@ function switchToTouch(st) {
   toast('터치 모드로 바꿨어요. 화면 아래 건반을 눌러 연주하세요. 설정에서 다시 마이크로 바꿀 수 있어요.', { type: 'success' });
 }
 
+// ------------------------------------------------------------------ lost input (mic unplugged / revoked mid-song)
+
+/** True when the run judges from the shared AudioInput (mic or simulation), so losing it matters. */
+export function needsInput(st) {
+  const s = st.session;
+  return !!(s && s.input && st.mode !== 'listen' && st.inputMode !== 'touch');
+}
+
+/** True when 계속 / 처음부터 must restart the input first. */
+export function needsReconnect(st) {
+  return needsInput(st) && st.session.input.state !== 'running';
+}
+
+/**
+ * What an AudioInput state change means for a run in `sessionState`: 'clear' (the input is back), 'pause' (stopped
+ * from elsewhere: pause, 계속 restarts it), 'explain' (failed: pause and say why) or '' (nothing to do). Any state
+ * but running/requesting means no more detections ('error' | 'denied' | 'unsupported' after a failure, 'idle' when
+ * stopped): pausing beats letting every note go by as MISS or holding forever.
+ */
+export function inputStateAction(inputState, sessionState) {
+  if (inputState === 'requesting') return '';
+  if (inputState === 'running') return 'clear';
+  if (!ACTIVE.has(sessionState) && sessionState !== 'paused') return '';
+  return inputState === 'idle' ? 'pause' : 'explain';
+}
+
+/**
+ * Message for the pause-overlay error panel. `lost`: the input died mid-song (vs. a failed reconnect). `touch`
+ * offers '터치로 계속하기' for the rest of this run (never in calibrate mode, see micErrorInfo).
+ */
+export function inputErrorInfo(st, err, lost) {
+  const code = err && err.code;
+  const info = lost && code !== 'denied' && code !== 'insecure' && code !== 'unsupported'
+    ? {
+      title: '마이크 연결이 끊어졌어요',
+      body: '다른 앱이 마이크를 쓰고 있거나 마이크 연결·권한이 바뀌었을 수 있어요. ‘다시 연결’을 누르면 마이크를 다시 켜요.',
+    }
+    : micErrorInfo(st, err);
+  const touch = st.mode !== 'calibrate' && info.touch !== false
+    && !!st.session && typeof st.session.updateSettings === 'function';
+  return { ...info, touch };
+}
+
+/**
+ * Whether screen keys / the computer keyboard play in `mode`. Not in listen mode (auto-play), and not in calibrate
+ * mode, which measures the mic delay only: touch hits would come out near 0 ms and be saved as the mic latency.
+ */
+export function acceptsKeys(mode) {
+  return mode !== 'listen' && mode !== 'calibrate';
+}
+
+/** Pauses the run when the shared AudioInput dies mid-song (track ended, permission revoked) and says why. */
+function watchInput(st, input) {
+  if (!input || typeof input.on !== 'function') return;
+  let off = null;
+  try {
+    off = input.on('state', (state) => onInputState(st, input, state));
+  } catch (err) {
+    console.warn('[play] input state', err);
+  }
+  if (typeof off === 'function') st.cleanups.push(off);
+  // It may already have failed while the session was being prepared.
+  if (input.state !== 'running') onInputState(st, input, input.state);
+}
+
+function onInputState(st, input, state) {
+  if (S !== st || st.finished || st.reconnecting || !needsInput(st)) return;
+  const s = st.session;
+  if (s.input !== input) return;
+  const action = inputStateAction(state, s.state);
+  if (action === 'clear') {
+    clearInputError(st);
+    return;
+  }
+  if (!action) return;
+  if (ACTIVE.has(s.state)) s.pause();
+  // A plain stop needs no explanation: 계속 restarts it.
+  if (action === 'explain') showInputError(st, input.lastError, true);
+}
+
+/**
+ * Error panel inside the pause overlay. `lost`: the input died mid-song (vs. a failed reconnect). Also toasts when
+ * the run is not paused, so the overlay is not showing (e.g. 다시하기 on the finish panel).
+ */
+function showInputError(st, err, lost) {
+  const e = st.els;
+  if (!e.pauseErr || S !== st) return;
+  const info = inputErrorInfo(st, err, lost);
+  e.pauseErr.replaceChildren(...errorBox(info, [
+    info.touch
+      ? h('button', { type: 'button', class: 'btn small', onClick: () => continueWithTouch(st) }, '터치로 계속하기')
+      : null,
+  ]));
+  e.pauseErr.hidden = false;
+  if (e.resumeBtn) e.resumeBtn.textContent = '다시 연결';
+  if (st.finished || !st.session || st.session.state !== 'paused') {
+    toast(`${info.title}. ${info.body}`, { type: 'error' });
+  }
+}
+
+function clearInputError(st) {
+  const e = st.els;
+  if (!e.pauseErr || e.pauseErr.hidden) return;
+  e.pauseErr.hidden = true;
+  e.pauseErr.replaceChildren();
+  if (e.resumeBtn) e.resumeBtn.textContent = '계속';
+}
+
+function setReconnecting(st, busy) {
+  st.reconnecting = busy;
+  const e = st.els;
+  if (e.resumeBtn) {
+    e.resumeBtn.disabled = busy;
+    e.resumeBtn.classList.toggle('is-busy', busy);
+    if (busy) e.resumeBtn.textContent = '마이크 연결 중…';
+    else e.resumeBtn.textContent = e.pauseErr && !e.pauseErr.hidden ? '다시 연결' : '계속';
+  }
+  if (e.restartBtn) e.restartBtn.disabled = busy;
+}
+
+/**
+ * Makes sure the session's input is running before 계속 / 처음부터. Must be reached without an earlier await from
+ * the click or key handler: restarting the mic and resuming audio need the user gesture. Resolves true to go on.
+ */
+async function reconnectInput(st) {
+  const s = st.session;
+  if (!needsReconnect(st)) return true;
+  if (st.reconnecting) return false;
+  setReconnecting(st, true);
+  let inp = null;
+  let error = null;
+  try {
+    inp = await st.app.ensureInput();
+  } catch (err) {
+    error = err;
+  }
+  setReconnecting(st, false);
+  if (S !== st || st.session !== s) return false;
+  // GameSession stays subscribed to the same AudioInput object, so restarting that object is enough.
+  if (!error && inp === s.input && s.input.state === 'running') {
+    clearInputError(st);
+    return true;
+  }
+  console.warn('[play] input restart failed', error);
+  showInputError(st, error || s.input.lastError, false);
+  return false;
+}
+
+/**
+ * '터치로 계속하기' after the mic was lost: the rest of THIS run is played on the screen keys. The saved input mode
+ * (and any ?input= override) is left alone, so a brief mic dropout does not turn every later song into touch mode.
+ */
+function continueWithTouch(st) {
+  const s = st.session;
+  if (!s || S !== st || st.finished || st.mode === 'calibrate' || st.reconnecting) return;
+  try {
+    s.updateSettings({ inputMode: 'touch' });
+  } catch (err) {
+    console.warn('[play] switch session to touch', err);
+    return;
+  }
+  st.inputMode = 'touch';
+  st.settings.inputMode = 'touch';
+  // The dead input is no longer needed by this run (switching the saved mode used to stop it too); the next song
+  // starts it again through app.ensureInput(). Stopped after the switch, so its 'idle' event no longer pauses.
+  const inp = s.input;
+  if (inp && (inp.state === 'running' || inp.state === 'requesting') && typeof inp.stop === 'function') {
+    try { inp.stop(); } catch (err) { console.warn('[play] input stop', err); }
+  }
+  clearInputError(st);
+  st.els.detect.hidden = true;
+  updateInputUi(st);
+  toast('이번 곡은 터치로 이어서 연주해요. 화면 아래 건반을 눌러 주세요. (설정의 입력 방식은 그대로예요)', { type: 'success' });
+  resume(st);
+}
+
 // ------------------------------------------------------------------ start / session
 
 async function onStart(st) {
   if (st.starting || st.session || S !== st || st.els.ready.hidden) return;
-  st.starting = true;
   const e = st.els;
+  if (st.mode === 'calibrate' && st.inputMode === 'touch') {
+    // Screen keys are ignored while calibrating; only the mic delay can be measured.
+    showMicError(st, null, {
+      title: '마이크가 필요해요',
+      body: '타이밍 보정은 마이크로 들은 피아노 소리의 지연을 재요. 설정에서 입력 방식을 마이크로 바꾼 뒤 다시 측정해 주세요.',
+      touch: false,
+      retry: false,
+    });
+    return;
+  }
+  st.starting = true;
   const usesInput = st.mode !== 'listen';
   setStartBusy(st, true, usesInput && st.inputMode === 'mic' ? '마이크 연결 중…' : '준비 중…');
   e.micErr.hidden = true;
@@ -648,6 +858,7 @@ async function onStart(st) {
   const active = document.activeElement;
   if (active && typeof active.blur === 'function' && active !== document.body) active.blur();
   keepAwake(st, true);
+  if (input && usesInput) watchInput(st, input);
 }
 
 // Quick toggles chosen on the ready panel win even if persisting them failed.
@@ -689,18 +900,24 @@ async function createSession(st, settings, input) {
 function togglePause(st) {
   const s = st.session;
   if (!s || st.finished) return;
-  if (s.state === 'paused') s.resume();
+  if (s.state === 'paused') resume(st);
   else if (ACTIVE.has(s.state)) s.pause();
 }
 
-function resume(st) {
+// resume() and restart() are called straight from click/key handlers: reconnectInput() needs that user gesture.
+async function resume(st) {
   const s = st.session;
-  if (s && !st.finished && s.state === 'paused') s.resume();
+  if (!s || st.finished || s.state !== 'paused') return;
+  if (!(await reconnectInput(st))) return;
+  if (S !== st || st.session !== s || st.finished || s.state !== 'paused') return;
+  s.resume();
 }
 
-function restart(st) {
+async function restart(st) {
   const s = st.session;
-  if (!s || S !== st) return;
+  if (!s || S !== st || st.reconnecting) return;
+  if (!(await reconnectInput(st))) return;
+  if (S !== st || st.session !== s) return;
   clearTimeout(st.finishTimer);
   st.finishTimer = 0;
   st.finished = false;
@@ -728,22 +945,39 @@ function restart(st) {
   keepAwake(st, true);
 }
 
+const QUIT_TEXT = {
+  listen: ['듣기를 그만둘까요?', '언제든 다시 들을 수 있어요.'],
+  calibrate: ['측정을 그만둘까요?', '측정 결과는 저장되지 않아요.'],
+};
+
 async function onBackButton(st) {
   const s = st.session;
-  if (s && !st.finished && ACTIVE.has(s.state)) {
-    s.pause();
-    const ok = await confirmDialog({
-      title: '연주를 그만둘까요?',
-      message: '지금까지의 연주는 기록되지 않아요.',
-      okText: '나가기',
-      cancelText: '계속 있기',
-      danger: true,
-    });
-    if (S !== st) return;
-    if (ok) goExit(st);
+  // Paused counts as mid-run too, so a stray activation of this button never drops the run without asking.
+  if (!s || st.finished || !(ACTIVE.has(s.state) || s.state === 'paused')) {
+    goExit(st);
     return;
   }
-  goExit(st);
+  if (st.confirmingExit) return;
+  if (ACTIVE.has(s.state)) s.pause();
+  const [title, message] = QUIT_TEXT[st.mode] || ['연주를 그만둘까요?', '지금까지의 연주는 기록되지 않아요.'];
+  st.confirmingExit = true;
+  let ok = false;
+  try {
+    ok = await confirmDialog({ title, message, okText: '나가기', cancelText: '계속 있기', danger: true });
+  } finally {
+    st.confirmingExit = false;
+  }
+  if (S !== st) return;
+  if (ok) {
+    goExit(st);
+    return;
+  }
+  // The dialog handed focus back to this button. Drop it, or Space (the advertised resume key, which onKeyDown
+  // leaves to a focused button) or Enter would click it again.
+  const back = st.els.back;
+  if (back && document.activeElement === back) {
+    try { back.blur(); } catch { /* ignore */ }
+  }
 }
 
 // ------------------------------------------------------------------ finish
@@ -1041,9 +1275,11 @@ function onResize(st) {
 
 // ------------------------------------------------------------------ input (touch keys, computer keyboard)
 
+// Screen keys and the computer keyboard play nothing in listen mode and are ignored in calibrate mode (acceptsKeys).
 function pressKey(st, m) {
   const s = st.session;
-  if (!s || st.finished || st.mode === 'listen' || !(m >= 0 && m <= 127) || !ACTIVE.has(s.state)) return false;
+  if (!s || st.finished || !acceptsKeys(st.mode)) return false;
+  if (!(m >= 0 && m <= 127) || !ACTIVE.has(s.state)) return false;
   if (st.keyRefs[m]++ > 0) return true;
   try { s.touchDown(m); } catch (err) { console.warn('[play] touchDown', err); }
   return true;
@@ -1152,3 +1388,22 @@ function onKeyDown(st, ev) {
   if (ev.repeat || st.heldCodes.has(ev.code)) return;
   if (pressKey(st, m)) st.heldCodes.set(ev.code, m);
 }
+
+// ------------------------------------------------------------------ test seam
+
+/**
+ * For node:test only (tests/play.test.js): drives the run logic against a hand-made state object without a DOM.
+ * `attach(st)` makes `st` the mounted screen (null detaches); nothing here is used by the app.
+ */
+export const __test = Object.freeze({
+  attach(st) { S = st; },
+  watchInput,
+  onInputState,
+  reconnectInput,
+  resume,
+  restart,
+  continueWithTouch,
+  switchToTouch,
+  pressKey,
+  onBackButton,
+});

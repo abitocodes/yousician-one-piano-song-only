@@ -79,6 +79,33 @@ test('estimateGateDb follows the detector gate formula', () => {
   assert.equal(cal.estimateGateDb(5, -200), -65); // sensitivity clamped to 1
 });
 
+test('estimateGateDb: noise-floor margin depends on sensitivity like the detector (11 − 5·s dB)', () => {
+  // detector.js: gate = max(−40 − 25·s, floor + (11 − 5·s))
+  const detectorGate = (s, floor) => Math.max(-40 - 25 * s, floor + (11 - 5 * s));
+  for (const s of [0, 0.25, 0.6, 1]) {
+    for (const floor of [-100, -70, -55, -45, -30]) {
+      assert.ok(Math.abs(cal.estimateGateDb(s, floor) - detectorGate(s, floor)) < 1e-9, `s=${s} floor=${floor}`);
+    }
+  }
+  assert.equal(cal.estimateGateDb(0, -50), -39); // margin 11 dB at the lowest sensitivity
+  assert.equal(cal.estimateGateDb(1, -50), -44); // margin 6 dB at the highest sensitivity
+});
+
+test('latency slider / ±10 range matches the auto-measure range (−100..500 ms)', () => {
+  assert.deepEqual({ ...cal.LATENCY_RANGE_MS }, { min: -100, max: 500 });
+  const measured = cal.analyzeCalibration({ deltas: [0.45, 0.45, 0.45, 0.45] });
+  assert.equal(measured.latency, 0.45);
+  assert.ok(measured.latency * 1000 <= cal.LATENCY_RANGE_MS.max);
+  // '+10' after a measured 450 ms raises it instead of snapping down to the old 400 ms cap
+  assert.equal(cal.nudgeLatency(0.45, 10), 0.46);
+  assert.equal(cal.nudgeLatency(0.495, 10), 0.5);
+  assert.equal(cal.nudgeLatency(0.5, 10), 0.5);
+  assert.equal(cal.nudgeLatency(0.45, -10), 0.44);
+  assert.equal(cal.nudgeLatency(-0.095, -10), -0.1);
+  assert.equal(cal.nudgeLatency(NaN, 10), 0.01);
+  assert.equal(cal.nudgeLatency(0.1004, 0), 0.1); // rounded to 1 ms
+});
+
 test('micErrorMessage gives Korean guidance per error code', () => {
   for (const code of ['insecure', 'denied', 'unsupported', 'error']) {
     const m = cal.micErrorMessage({ code, message: 'Device busy' });

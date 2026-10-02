@@ -196,8 +196,13 @@ body[data-screen="play"] {
   white-space: nowrap;
 }
 
-.pk-karaoke .pk-kara-slot.is-top { justify-content: flex-start; }
-.pk-karaoke .pk-kara-slot.is-bottom { justify-content: flex-end; }
+.pk-karaoke .pk-kara-slot.is-top,
+.pk-karaoke .pk-kara-slot.is-bottom { justify-content: flex-start; }
+
+/* Bottom line is right-aligned by an auto margin, not justify-content: flex-end. Auto margins drop to 0 when the
+   line is wider than the slot, so it overflows on the right and its start (sung first) stays visible, as in the
+   top slot. (`safe flex-end` would do the same but needs Chromium 115+.) */
+.pk-karaoke .pk-kara-slot.is-bottom .pk-kara-line { margin-left: auto; text-align: right; }
 
 .pk-karaoke .pk-kara-line {
   position: relative;
@@ -209,6 +214,9 @@ body[data-screen="play"] {
   white-space: nowrap;
   animation: pk-kara-in 0.3s cubic-bezier(0.2, 1, 0.4, 1) both;
 }
+
+/* Still too wide at the smallest font size (Karaoke._fit): wrap between syllables instead of clipping. */
+.pk-karaoke .pk-kara-line.is-wrap { white-space: normal; }
 
 .pk-karaoke .syl {
   position: relative;
@@ -237,10 +245,22 @@ body[data-screen="play"] {
     -0.06em 0 1px #f4f9ff, -0.052em -0.03em 1px #f4f9ff, -0.03em -0.052em 1px #f4f9ff,
     0 -0.06em 1px #f4f9ff, 0.03em -0.052em 1px #f4f9ff, 0.052em -0.03em 1px #f4f9ff,
     0 0 0.35em rgba(56, 189, 248, 0.75);
-  /* Outline overflows the box, hence the ±0.3em margins around the spec's inset(0 calc((1 - p) * 100%) 0 0). */
-  -webkit-clip-path: inset(-0.3em calc((1 - var(--p, 0)) * (100% + 0.6em) - 0.3em) -0.3em -0.3em);
-  clip-path: inset(-0.3em calc((1 - var(--p, 0)) * (100% + 0.6em) - 0.3em) -0.3em -0.3em);
+  /* The wipe edge sweeps the glyph box itself, inset(0 calc((1 - p) * 100%) 0 0), over the whole syllable. The
+     outline overflows the box by up to 0.3em: Karaoke opens the left margin once the wipe starts (.is-on) and the
+     right one when it is complete (.is-done), so the margins never shift the wipe's timing. */
+  -webkit-clip-path: inset(-0.3em calc((1 - var(--p, 0)) * 100%) -0.3em 0);
+  clip-path: inset(-0.3em calc((1 - var(--p, 0)) * 100%) -0.3em 0);
   pointer-events: none;
+}
+
+.pk-karaoke .fill.is-on {
+  -webkit-clip-path: inset(-0.3em calc((1 - var(--p, 0)) * 100%) -0.3em -0.3em);
+  clip-path: inset(-0.3em calc((1 - var(--p, 0)) * 100%) -0.3em -0.3em);
+}
+
+.pk-karaoke .fill.is-done {
+  -webkit-clip-path: inset(-0.3em);
+  clip-path: inset(-0.3em);
 }
 
 .pk-karaoke .pk-kara-dots {
@@ -641,6 +661,10 @@ body[data-screen="play"] {
   color: var(--muted);
   font-variant-numeric: tabular-nums;
 }
+
+/* Lost-mic message inside the pause panel (play.js showInputError). */
+[data-screen="play"] .pk-pause-error { text-align: left; }
+[data-screen="play"] .pk-pause-panel .btn.is-busy:disabled { opacity: 0.8; }
 
 [data-screen="play"] .pk-stack-actions {
   display: flex;

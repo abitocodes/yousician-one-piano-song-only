@@ -82,6 +82,37 @@ export function safeLocalStorage() {
   return sharedStorage;
 }
 
+/** sessionStorage when it is usable (it survives reloads of this tab), otherwise null. */
+export function safeSessionStorage() {
+  try {
+    const ss = globalThis.sessionStorage;
+    if (!ss) return null;
+    const probe = '__pk_probe__';
+    ss.setItem(probe, '1');
+    ss.removeItem(probe);
+    return ss;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * At-most-once-per-window guard that survives page reloads ("reload at most once every 30 s", against loops).
+ * True when no claim for `key` was recorded in the last `windowMs` ms; the claim is then recorded. False when one
+ * was, or when `storage` is missing or failing — without a working guard the caller must not act.
+ */
+export function claimOnce(storage, key, windowMs, now = Date.now()) {
+  if (!storage) return false;
+  try {
+    const last = Number(storage.getItem(key));
+    if (last > 0 && now >= last && now - last < windowMs) return false;
+    storage.setItem(key, String(now));
+    return storage.getItem(key) === String(now);
+  } catch {
+    return false;
+  }
+}
+
 function readJson(storage, key) {
   try {
     const raw = storage.getItem(key);

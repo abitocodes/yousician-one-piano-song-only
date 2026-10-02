@@ -63,6 +63,20 @@ test('hold freezes at an explicit song time; release continues from it', () => {
   close(c.time(9.5), 5.5);
 });
 
+test('release at an earlier context time catches up (no time lost to a late-detected strike)', () => {
+  const c = new GameClock();
+  c.start(0, 0);
+  // The note reached the line at ctx 5; the frame noticed it at 5.01 and held there.
+  c.hold(5.01, 5);
+  close(c.time(5.2), 5);
+  // The strike that released it happened at ctx 5 but was only detected at 5.2.
+  c.release(5);
+  assert.equal(c.running, true);
+  close(c.time(5.2), 5.2);
+  close(c.time(6), 6);
+  close(c.toCtx(7), 7);
+});
+
 test('hold without a song time freezes at the current time', () => {
   const c = new GameClock();
   c.start(0, 1);

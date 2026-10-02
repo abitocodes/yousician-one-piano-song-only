@@ -4,7 +4,6 @@
   "description": "실제 피아노로 치면 마이크가 음정과 타이밍을 판정하는 노래방 스타일 리듬게임",
   "lang": "ko",
   "dir": "ltr",
-  "id": "./",
   "start_url": "./",
   "scope": "./",
   "display": "fullscreen",

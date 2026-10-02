@@ -178,6 +178,19 @@ export function toast(message, opts = {}) {
 
 const modalStack = [];
 let modalSeq = 0;
+const modalListeners = new Set();
+
+/** Calls fn(openCount) after a modal opens or closes. Returns the remover. */
+export function onModalChange(fn) {
+  modalListeners.add(fn);
+  return () => modalListeners.delete(fn);
+}
+
+function notifyModalChange() {
+  for (const fn of [...modalListeners]) {
+    try { fn(modalStack.length); } catch (err) { console.error(err); }
+  }
+}
 
 function onModalKey(e) {
   if (e.key !== 'Escape' || !modalStack.length) return;
@@ -279,6 +292,7 @@ export function modal({ title = '', content = null, actions = [], dismissible = 
       if (onClose) {
         try { onClose(reason); } catch (err) { console.error(err); }
       }
+      notifyModalChange();
     },
   };
 
@@ -288,6 +302,7 @@ export function modal({ title = '', content = null, actions = [], dismissible = 
   }
   modalStack.push(api);
   root.append(backdrop);
+  notifyModalChange();
   requestAnimationFrame(() => {
     backdrop.classList.add('show');
     const focusTarget = dialog.querySelector('[autofocus]') || dialog.querySelector('.modal-actions .btn.primary') || dialog;
@@ -328,6 +343,16 @@ export function downloadFile(filename, content, mime = 'application/json') {
   setTimeout(() => URL.revokeObjectURL(url), 60000);
 }
 
+let openPickers = 0;
+// A browser without the 'cancel' event never reports a dismissed picker. Once the page has had the focus back for
+// this long, such a picker no longer counts as open (its promise still resolves if a file arrives after all).
+const PICKER_STALE_MS = 60000;
+
+/** True while a system file picker opened by pickFile() has not reported back (app updates wait for it). */
+export function isPickingFile() {
+  return openPickers > 0;
+}
+
 /** Opens the system file picker. Resolves the chosen File, or null when the picker reports a cancel. */
 export function pickFile(accept = '') {
   return new Promise((resolve) => {
@@ -339,9 +364,28 @@ export function pickFile(accept = '') {
       'aria-hidden': 'true',
     });
     let done = false;
+    let counted = true;
+    let staleTimer = 0;
+    openPickers++;
+    const onBack = () => {
+      if (document.visibilityState === 'hidden') return;
+      clearTimeout(staleTimer);
+      staleTimer = setTimeout(uncount, PICKER_STALE_MS);
+    };
+    function uncount() {
+      clearTimeout(staleTimer);
+      window.removeEventListener('focus', onBack);
+      document.removeEventListener('visibilitychange', onBack);
+      if (!counted) return;
+      counted = false;
+      openPickers--;
+    }
+    window.addEventListener('focus', onBack);
+    document.addEventListener('visibilitychange', onBack);
     const finish = (file) => {
       if (done) return;
       done = true;
+      uncount();
       input.remove();
       resolve(file || null);
     };

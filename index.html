@@ -49,7 +49,42 @@
     document.querySelector('#boot .boot-msg').textContent = '이 브라우저는 너무 오래되어 실행할 수 없어요. 최신 Chrome 또는 삼성 인터넷으로 열어 주세요.';
   </script>
   <script>
-    // Boot watchdog: if the module graph fails to load (old browser, network error), explain instead of a blank screen.
+    // Recovery for a version that cannot start, used by the boot watchdog below and by the error panel of js/app.js.
+    // A plain reload would start the same cached version again (the service worker serves one version until a page
+    // activates the next): activate a fixed version that already waits, otherwise (online) remove this app's worker
+    // and caches so that the reload fetches the current files. Only this app's registration and caches are touched.
+    window.__pkRecover = function () {
+      var CACHE_PREFIX = 'piano-karaoke-';
+      var done = false;
+      function reload() {
+        if (done) return;
+        done = true;
+        location.reload();
+      }
+      var sw = navigator.serviceWorker;
+      if (!sw || !sw.getRegistration) return reload();
+      setTimeout(reload, 5000);
+      var scope = new URL('./', location.href);
+      sw.getRegistration(scope.href).then(function (reg) {
+        if (!reg || new URL(reg.scope).pathname !== scope.pathname) return reload();
+        if (reg.waiting) {
+          sw.addEventListener('controllerchange', reload);
+          reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+          return;
+        }
+        if (navigator.onLine === false) return reload();
+        var own = '@' + scope.pathname;
+        return reg.unregister().then(function () {
+          return window.caches ? window.caches.keys() : [];
+        }).then(function (keys) {
+          return Promise.all(keys.filter(function (k) {
+            return k.indexOf(CACHE_PREFIX) === 0 && k.slice(-own.length) === own;
+          }).map(function (k) { return window.caches.delete(k); }));
+        }).then(reload, reload);
+      }).catch(reload);
+    };
+    // Boot watchdog: if the module graph fails to load (old browser, network error, broken version), explain instead
+    // of a blank screen.
     setTimeout(function () {
       if (window.__pkBooted) return;
       var msg = document.querySelector('#boot .boot-msg');
@@ -59,7 +94,10 @@
       btn.className = 'btn primary';
       btn.type = 'button';
       btn.textContent = '새로고침';
-      btn.onclick = function () { location.reload(); };
+      btn.onclick = function () {
+        btn.disabled = true;
+        window.__pkRecover();
+      };
       msg.appendChild(document.createElement('br'));
       msg.appendChild(btn);
     }, 12000);
